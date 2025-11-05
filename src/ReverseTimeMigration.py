@@ -247,11 +247,11 @@ class ReverseTimeMigration:
                 self.steepness_array = steepness_array
 
                 if self.debug:
-                    plt.plot(height_array.get())
+                    plt.plot(height_array)
                     plt.title('Surface Shape')
                     plt.show()
 
-                    plt.imshow(surface_matrix.get().T)
+                    plt.imshow(surface_matrix.T)
                     plt.title('Surface Matrix')
                     plt.show()
 
@@ -395,9 +395,9 @@ class ReverseTimeMigration:
         zmin = float(zmin)
         zmax = float(zmax)
 
-        umap = self.image_u.get().T
-        vmap = self.image_v.get().T
-        wmap = self.image_w.get().T
+        umap = self.image_u.T
+        vmap = self.image_v.T
+        wmap = self.image_w.T
         if mean:
             umap = umap - np.mean(umap)
             vmap = vmap - np.mean(vmap)
