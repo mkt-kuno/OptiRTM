@@ -22,48 +22,83 @@ matplotlib.use('Agg')  # Non-interactive backend for environments without displa
 import matplotlib.pyplot as plt
 import os
 
-# JIT-optimized functions for performance
-@jit(nopython=True, parallel=True, fastmath=True)
-def update_vel_order2_fw_jit(u, w, v, sxx, szz, sxz, syx, syz, dx, dz, dt, rho_u, rho_w, rho):
-    """JIT-optimized velocity update for forward modeling order 2"""
+# Highly optimized JIT functions for forward modeling
+@jit(nopython=True, parallel=True, fastmath=True, cache=True, inline='always')
+def update_vel_order2_fw_jit(u, w, v, sxx, szz, sxz, syx, syz, inv_dx, inv_dz, dt, dt_rho_u, dt_rho_w, dt_rho):
+    """
+    Aggressively optimized velocity update for forward modeling with:
+    - Pre-computed reciprocals (inv_dx, inv_dz, dt/rho)
+    - Fused P-SV and SH wave updates
+    - Cache-friendly access patterns
+    - Reduced memory loads through register reuse
+    """
     nx, nz = u.shape
-    # P-SV wave update:
     for i in prange(1, nx - 1):
         for j in range(1, nz - 1):
-            sxx_x = (sxx[i, j] - sxx[i-1, j]) / dx
-            szz_z = (szz[i, j] - szz[i, j-1]) / dz
-            sxz_x = (sxz[i, j] - sxz[i-1, j]) / dx
-            sxz_z = (sxz[i, j] - sxz[i, j-1]) / dz
-            u[i, j] += (sxx_x + sxz_z) * dt / rho_u[i, j]
-            w[i, j] += (sxz_x + szz_z) * dt / rho_w[i, j]
-            # SH wave update:
-            syx_x = (syx[i, j] - syx[i-1, j]) / dx
-            syz_z = (syz[i, j] - syz[i, j-1]) / dz
-            v[i, j] += (syx_x + syz_z) * dt / rho[i, j]
+            # Load stress values once
+            sxx_i = sxx[i, j]
+            sxx_im1 = sxx[i-1, j]
+            szz_j = szz[i, j]
+            szz_jm1 = szz[i, j-1]
+            sxz_i = sxz[i, j]
+            sxz_im1 = sxz[i-1, j]
+            sxz_jm1 = sxz[i, j-1]
+            
+            # P-SV wave with pre-computed reciprocals
+            sxx_x = (sxx_i - sxx_im1) * inv_dx
+            szz_z = (szz_j - szz_jm1) * inv_dz
+            sxz_x = (sxz_i - sxz_im1) * inv_dx
+            sxz_z = (sxz_i - sxz_jm1) * inv_dz
+            
+            # Fused multiply-add operations
+            u[i, j] += (sxx_x + sxz_z) * dt_rho_u[i, j]
+            w[i, j] += (sxz_x + szz_z) * dt_rho_w[i, j]
+            
+            # SH wave inline
+            syx_x = (syx[i, j] - syx[i-1, j]) * inv_dx
+            syz_z = (syz[i, j] - syz[i, j-1]) * inv_dz
+            v[i, j] += (syx_x + syz_z) * dt_rho[i, j]
 
-@jit(nopython=True, parallel=True, fastmath=True)
-def update_str_order2_fw_jit(u, w, v, sxx, szz, sxz, syx, syz, dx, dz, dt, lam, mu, mxz, myx, myz):
-    """JIT-optimized stress update for forward modeling order 2"""
+@jit(nopython=True, parallel=True, fastmath=True, cache=True, inline='always')
+def update_str_order2_fw_jit(u, w, v, sxx, szz, sxz, syx, syz, inv_dx, inv_dz, dt, lam, mu, mxz, myx, myz):
+    """
+    Highly optimized stress update for forward modeling with:
+    - Pre-computed reciprocals
+    - Reduced redundant calculations
+    - Register reuse for velocity values
+    """
     nx, nz = u.shape
-    # P-SV wave update:
     for i in prange(1, nx - 1):
         for j in range(1, nz - 1):
-            u_x = (u[i+1, j] - u[i, j]) / dx
-            u_z = (u[i, j+1] - u[i, j]) / dz
-            w_x = (w[i+1, j] - w[i, j]) / dx
-            w_z = (w[i, j+1] - w[i, j]) / dz
-            sxx[i, j] += dt * (lam[i, j] * (u_x + w_z) + 2.0 * mu[i, j] * u_x)
-            szz[i, j] += dt * (lam[i, j] * (u_x + w_z) + 2.0 * mu[i, j] * w_z)
-            sxz[i, j] += dt * (mxz[i, j] * (u_z + w_x))
-            # SH wave update:
-            v_x = (v[i+1, j] - v[i, j]) / dx
-            v_z = (v[i, j+1] - v[i, j]) / dz
+            # Load and reuse velocity values
+            u_ij = u[i, j]
+            w_ij = w[i, j]
+            v_ij = v[i, j]
+            
+            # Compute derivatives with pre-computed reciprocals
+            u_x = (u[i+1, j] - u_ij) * inv_dx
+            u_z = (u[i, j+1] - u_ij) * inv_dz
+            w_x = (w[i+1, j] - w_ij) * inv_dx
+            w_z = (w[i, j+1] - w_ij) * inv_dz
+            
+            # Compute common term once
+            div_vel = u_x + w_z
+            lam_div = lam[i, j] * div_vel
+            
+            # P-SV wave with fused operations
+            sxx[i, j] += dt * (lam_div + 2.0 * mu[i, j] * u_x)
+            szz[i, j] += dt * (lam_div + 2.0 * mu[i, j] * w_z)
+            sxz[i, j] += dt * mxz[i, j] * (u_z + w_x)
+            
+            # SH wave inline
+            v_x = (v[i+1, j] - v_ij) * inv_dx
+            v_z = (v[i, j+1] - v_ij) * inv_dz
             syx[i, j] += dt * myx[i, j] * v_x
             syz[i, j] += dt * myz[i, j] * v_z
 
-@jit(nopython=True, parallel=True, fastmath=True)
+@jit(nopython=True, parallel=True, fastmath=True, cache=True)
 def apply_absorbing_coeff(u, v, w, absorb_coeff):
-    """JIT-optimized application of absorbing coefficients"""
+    """Optimized application of absorbing coefficients"""
     nx, nz = u.shape
     for i in prange(nx):
         for j in range(nz):
@@ -72,9 +107,9 @@ def apply_absorbing_coeff(u, v, w, absorb_coeff):
             v[i, j] *= coeff
             w[i, j] *= coeff
 
-@jit(nopython=True, parallel=True, fastmath=True)
+@jit(nopython=True, parallel=True, fastmath=True, cache=True)
 def apply_absorbing_coeff_stress(sxx, szz, sxz, syx, syz, absorb_coeff):
-    """JIT-optimized application of absorbing coefficients to stress"""
+    """Optimized application of absorbing coefficients to stress"""
     nx, nz = sxx.shape
     for i in prange(nx):
         for j in range(nz):
@@ -84,6 +119,87 @@ def apply_absorbing_coeff_stress(sxx, szz, sxz, syx, syz, absorb_coeff):
             sxz[i, j] *= coeff
             syx[i, j] *= coeff
             syz[i, j] *= coeff
+
+# Shared optimized helper functions
+@jit(nopython=True, fastmath=True, cache=True)
+def compute_absorbing_coeff(nx, nz, FW, a=0.0053):
+    """Optimized absorbing coefficient computation"""
+    coeff = np.exp(-a**2 * np.arange(FW, 0, -1)**2)
+    absorb_coeff = np.ones((nx, nz), dtype=np.float32)
+    
+    for i in range(FW):
+        ze = nz - i - 1
+        absorb_coeff[i, :ze] = coeff[i]
+    
+    for i in range(FW):
+        ii = nx - i - 1
+        ze = nz - i - 1
+        absorb_coeff[ii, :ze] = coeff[i]
+    
+    for j in range(FW):
+        jj = nz - j - 1
+        xb = j
+        xe = nx - j
+        absorb_coeff[xb:xe, jj] = coeff[j]
+    
+    return absorb_coeff
+
+@jit(nopython=True, parallel=True, fastmath=True, cache=True)
+def compute_shear_avg_SH(mu):
+    """Optimized harmonic averaging for SH wave"""
+    nx, nz = mu.shape
+    mux = mu.copy()
+    muz = mu.copy()
+    
+    for i in prange(1, nx - 1):
+        for j in range(1, nz - 1):
+            mux[i, j] = 2.0 / (1.0 / mu[i, j] + 1.0 / mu[i+1, j])
+            muz[i, j] = 2.0 / (1.0 / mu[i, j] + 1.0 / mu[i, j+1])
+    
+    return mux, muz
+
+@jit(nopython=True, parallel=True, fastmath=True, cache=True)
+def compute_shear_avg_PSV(mu):
+    """Optimized harmonic averaging for P-SV wave"""
+    nx, nz = mu.shape
+    muxz = mu.copy()
+    
+    for i in prange(1, nx - 1):
+        for j in range(1, nz - 1):
+            inv_sum = 1.0 / mu[i, j] + 1.0 / mu[i+1, j] + 1.0 / mu[i, j+1] + 1.0 / mu[i+1, j+1]
+            muxz[i, j] = 4.0 / inv_sum
+    
+    return muxz
+
+@jit(nopython=True, parallel=True, fastmath=True, cache=True)
+def compute_rho_staggered(rho):
+    """Optimized staggered grid density computation"""
+    nx, nz = rho.shape
+    rho_u = rho.copy()
+    rho_w = rho.copy()
+    
+    for i in prange(1, nx - 1):
+        for j in range(1, nz - 1):
+            rho_u[i, j] = 0.5 * (rho[i, j] + rho[i+1, j])
+            rho_w[i, j] = 0.5 * (rho[i, j] + rho[i, j+1])
+    
+    return rho_u, rho_w
+
+@jit(nopython=True, parallel=True, fastmath=True, cache=True)
+def precompute_dt_over_rho(dt, rho_u, rho_w, rho):
+    """Pre-compute dt/rho arrays for optimal performance"""
+    nx, nz = rho.shape
+    dt_rho_u = np.empty_like(rho_u)
+    dt_rho_w = np.empty_like(rho_w)
+    dt_rho = np.empty_like(rho)
+    
+    for i in prange(nx):
+        for j in range(nz):
+            dt_rho_u[i, j] = dt / rho_u[i, j]
+            dt_rho_w[i, j] = dt / rho_w[i, j]
+            dt_rho[i, j] = dt / rho[i, j]
+    
+    return dt_rho_u, dt_rho_w, dt_rho
 
 """
     i,j               i+1,j
@@ -165,24 +281,22 @@ class forward_modeling:
         self.v = np.zeros((self.nx, self.nz), dtype=np.float32)
         self.w = np.zeros((self.nx, self.nz), dtype=np.float32)
 
-        # shear modulus mu
-        # mxx,mzz=self.mu for p-sv wave propagation
-        self.mxz = np.zeros((self.nx, self.nz), dtype=np.float32)
-        self.myx = np.zeros((self.nx, self.nz), dtype=np.float32)
-        self.myz = np.zeros((self.nx, self.nz), dtype=np.float32)
+        # Use optimized JIT functions for all preprocessing
+        self.myx, self.myz = compute_shear_avg_SH(self.mu)
+        self.mxz = compute_shear_avg_PSV(self.mu)
 
-        self.myx, self.myz = self.shear_avg_SH()
-        self.mxz = self.shear_avg_PSV()
+        # Compute staggered grid densities in one pass
+        self.rho_u, self.rho_w = compute_rho_staggered(self.rho)
 
-        # rho for timestep updating
-        self.rho_u = self.rhou()
-        self.rho_w = self.rhow()
-
-        # Bulk modulus lambda
-        # lxx, lzz = self.lam for p-sv wave propagation
+        # Pre-compute reciprocals for optimal performance
+        self.inv_dx = 1.0 / self.dx
+        self.inv_dz = 1.0 / self.dz
+        self.dt_rho_u, self.dt_rho_w, self.dt_rho = precompute_dt_over_rho(
+            self.dt, self.rho_u, self.rho_w, self.rho
+        )
         
-        # absorbing coefficient
-        self.absorb_coeff = self.absorb()
+        # Optimized absorbing coefficient
+        self.absorb_coeff = compute_absorbing_coeff(self.nx, self.nz, self.absorbing_frame)
 
         self.wavelet_u = self.initialize_wavelet(self.wavelet_u)
         self.wavelet_v = self.initialize_wavelet(self.wavelet_v)
