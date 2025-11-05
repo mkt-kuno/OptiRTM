@@ -17,9 +17,9 @@
 # 1. 順方向モデリング
 import numpy as np
 from numba import jit, prange
-import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use('TkAgg')  # または 'Agg' を使用
+matplotlib.use('Agg')  # Non-interactive backend for environments without display
+import matplotlib.pyplot as plt
 import os
 
 # JIT-optimized functions for performance

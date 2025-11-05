@@ -26,16 +26,16 @@ def get_source_ch(distance:np.array, source_x):
 """
 Reverse time migration set-up
 parameters:
-    observed_u: cupy.array, observed velocity data in x-axis
-    observed_v: cupy.array, observed velocity data in y-axis
-    observed_w: cupy.array, observed velocity data in z-axis
+    observed_u: numpy.array, observed velocity data in x-axis
+    observed_v: numpy.array, observed velocity data in y-axis
+    observed_w: numpy.array, observed velocity data in z-axis
 
-    source_u: cupy.array, source velocity data in x-axis
-    source_v: cupy.array, source velocity data in y-axis
-    source_w: cupy.array, source velocity data in z-axis
+    source_u: numpy.array, source velocity data in x-axis
+    source_v: numpy.array, source velocity data in y-axis
+    source_w: numpy.array, source velocity data in z-axis
 
-    receiver_loc: cupy.array, sensor position in x-axis
-    source_loc: cupy.array, source position in x-axis
+    receiver_loc: numpy.array, sensor position in x-axis
+    source_loc: numpy.array, source position in x-axis
 
     velocity: float, velocity of the medium
     fs: float, sampling frequency of acquisition data
