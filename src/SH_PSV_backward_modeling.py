@@ -19,6 +19,12 @@ import numpy as np
 from numba import jit, prange
 import matplotlib.pyplot as plt
 import copy
+# Import common RTM utilities
+from rtm_utils import (
+    compute_shear_avg_SH, compute_shear_avg_PSV, compute_rho_staggered,
+    precompute_dt_over_rho, compute_absorbing_coeff, apply_absorbing_coeff,
+    apply_absorbing_coeff_stress, check_array_finite, compute_cross_correlation
+)
 plt.style.use('fast')
 
 # JIT-optimized functions for performance with aggressive optimizations
@@ -97,140 +103,12 @@ def update_str_order2_jit(u, w, v, sxx, szz, sxz, syx, syz, inv_dx, inv_dz, neg_
             syx[i, j] += neg_dt * myx[i, j] * v_x
             syz[i, j] += neg_dt * myz[i, j] * v_z
 
-@jit(nopython=True, parallel=True, fastmath=True, cache=True)
-def apply_absorbing_coeff(u, v, w, absorb_coeff):
-    """
-    Optimized application of absorbing coefficients with:
-    - Better memory locality by processing row-wise
-    - Reduced load operations
-    """
-    nx, nz = u.shape
-    for i in prange(nx):
-        for j in range(nz):
-            coeff = absorb_coeff[i, j]
-            u[i, j] *= coeff
-            v[i, j] *= coeff
-            w[i, j] *= coeff
-
-@jit(nopython=True, parallel=True, fastmath=True, cache=True)
-def apply_absorbing_coeff_stress(sxx, szz, sxz, syx, syz, absorb_coeff):
-    """
-    Optimized application of absorbing coefficients to stress with:
-    - Better memory locality
-    - Single coefficient load for multiple arrays
-    """
-    nx, nz = sxx.shape
-    for i in prange(nx):
-        for j in range(nz):
-            coeff = absorb_coeff[i, j]
-            sxx[i, j] *= coeff
-            szz[i, j] *= coeff
-            sxz[i, j] *= coeff
-            syx[i, j] *= coeff
-            syz[i, j] *= coeff
-
-@jit(nopython=True, fastmath=True, cache=True)
-def compute_absorbing_coeff(nx, nz, FW, a=0.0053):
-    """
-    Optimized absorbing coefficient computation using vectorized operations.
-    Pre-compute exponential decay coefficients.
-    """
-    # Pre-compute all coefficients
-    coeff = np.exp(-a**2 * np.arange(FW, 0, -1)**2)
-    absorb_coeff = np.ones((nx, nz), dtype=np.float64)
-    
-    # Vectorized assignment for boundaries
-    # Left boundary
-    for i in range(FW):
-        ze = nz - i - 1
-        absorb_coeff[i, :ze] = coeff[i]
-    
-    # Right boundary
-    for i in range(FW):
-        ii = nx - i - 1
-        ze = nz - i - 1
-        absorb_coeff[ii, :ze] = coeff[i]
-    
-    # Bottom boundary
-    for j in range(FW):
-        jj = nz - j - 1
-        xb = j
-        xe = nx - j
-        absorb_coeff[xb:xe, jj] = coeff[j]
-    
-    return absorb_coeff
-
-@jit(nopython=True, parallel=True, fastmath=True, cache=True)
-def compute_shear_avg_SH(mu):
-    """
-    Optimized harmonic averaging for SH wave shear modulus.
-    Uses parallel loops and fused computation.
-    """
-    nx, nz = mu.shape
-    mux = mu.copy()
-    muz = mu.copy()
-    
-    for i in prange(1, nx - 1):
-        for j in range(1, nz - 1):
-            # Harmonic mean in x-direction
-            mux[i, j] = 2.0 / (1.0 / mu[i, j] + 1.0 / mu[i+1, j])
-            # Harmonic mean in z-direction
-            muz[i, j] = 2.0 / (1.0 / mu[i, j] + 1.0 / mu[i, j+1])
-    
-    return mux, muz
-
-@jit(nopython=True, parallel=True, fastmath=True, cache=True)
-def compute_shear_avg_PSV(mu):
-    """
-    Optimized harmonic averaging for P-SV wave shear modulus.
-    4-point harmonic mean computed in parallel.
-    """
-    nx, nz = mu.shape
-    muxz = mu.copy()
-    
-    for i in prange(1, nx - 1):
-        for j in range(1, nz - 1):
-            # 4-point harmonic mean
-            inv_sum = 1.0 / mu[i, j] + 1.0 / mu[i+1, j] + 1.0 / mu[i, j+1] + 1.0 / mu[i+1, j+1]
-            muxz[i, j] = 4.0 / inv_sum
-    
-    return muxz
-
-@jit(nopython=True, parallel=True, fastmath=True, cache=True)
-def compute_rho_staggered(rho):
-    """
-    Optimized staggered grid density computation for both u and w.
-    Returns both in one pass for better cache utilization.
-    """
-    nx, nz = rho.shape
-    rho_u = rho.copy()
-    rho_w = rho.copy()
-    
-    for i in prange(1, nx - 1):
-        for j in range(1, nz - 1):
-            rho_u[i, j] = 0.5 * (rho[i, j] + rho[i+1, j])
-            rho_w[i, j] = 0.5 * (rho[i, j] + rho[i, j+1])
-    
-    return rho_u, rho_w
-
-@jit(nopython=True, parallel=True, fastmath=True, cache=True)
-def precompute_dt_over_rho(dt, rho_u, rho_w, rho):
-    """
-    Pre-compute dt/rho arrays to avoid division in inner loops.
-    This is a critical optimization for the time-stepping loop.
-    """
-    nx, nz = rho.shape
-    dt_rho_u = np.empty_like(rho_u)
-    dt_rho_w = np.empty_like(rho_w)
-    dt_rho = np.empty_like(rho)
-    
-    for i in prange(nx):
-        for j in range(nz):
-            dt_rho_u[i, j] = dt / rho_u[i, j]
-            dt_rho_w[i, j] = dt / rho_w[i, j]
-            dt_rho[i, j] = dt / rho[i, j]
-    
-    return dt_rho_u, dt_rho_w, dt_rho
+# Removed duplicate functions - now using shared utilities from rtm_utils.py:
+# - apply_absorbing_coeff, apply_absorbing_coeff_stress
+# - compute_absorbing_coeff
+# - compute_shear_avg_SH, compute_shear_avg_PSV
+# - compute_rho_staggered
+# - precompute_dt_over_rho
 
 class backward_modeling:
     """
