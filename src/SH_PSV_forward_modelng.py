@@ -203,8 +203,11 @@ class forward_modeling:
             if wavelet.shape[0] != len(self.src_loc):
                 raise ValueError('wavelet shape is not match with src_loc')
             if wavelet.shape[1] != self.nt:
-                print('wavelet dhape is different to simulation duration. zero padding or cut')
-                wavelets = wavelet[:self.nt] if len(wavelet) > self.nt else np.pad(wavelet, (0,self.nt-len(wavelet)))
+                print('wavelet shape is different to simulation duration. zero padding or cut')
+                if wavelet.shape[1] > self.nt:
+                    wavelets = wavelet[:, :self.nt]
+                else:
+                    wavelets = np.pad(wavelet, ((0, 0), (0, self.nt - wavelet.shape[1])), mode='constant')
             else:
                 wavelets = wavelet
         return wavelets
