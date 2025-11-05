@@ -78,8 +78,8 @@ class ReverseTimeMigration:
         self.v_fix = kwargs['v_fix'] if 'v_fix' in kwargs else None
         self.debug = kwargs['debug'] if 'debug' in kwargs else False
         self.receivers_height = kwargs['receivers_height'] if 'receivers_height' in kwargs else None 
-        recerivers_height = self.receivers_height  - np.max(self.receivers_height) if self.receivers_height is not None else None
-        self.receivers_height = recerivers_height # recerivers_height is negative value. 0 is the highest point
+        receivers_height = self.receivers_height  - np.max(self.receivers_height) if self.receivers_height is not None else None
+        self.receivers_height = receivers_height # receivers_height is negative value. 0 is the highest point
 
         self.check_parameters()
         pass

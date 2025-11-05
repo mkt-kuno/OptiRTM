@@ -103,12 +103,12 @@ class backward_modeling:
     isnap:int 途中経過の表示ステップ数 default:10
     order:int 空間微分のオーダー(2 or 3) dedault:2
     ###
-    snap:np.array 途中経過の波場スナップショット for correlationg
+    snap:np.ndarray 途中経過の波場スナップショット for correlationg
     """
 
     def show(self, v:np.ndarray, suptitle):
         """
-        v:np.array 途中経過の波場スナップショット
+        v:np.ndarray 途中経過の波場スナップショット
         """
         mvmax = np.max(v)
         plt.figure(figsize=(8, 7))
