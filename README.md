@@ -12,8 +12,15 @@ We have created a program for reverse time migration in seismic exploration usin
 ## Reverse time migration program for seismic exploration
 Reverse Time Migration(RTM) is a seismic wave inversion method that calculates reflection cross sections by combining (closs-correlation, convolution, etc...) seismic wave forward and backward propagation data by the observed waveform and source.
 This program implements RTM using seismic wave forward propagation modeling and backward propagation equation of P-SV wave and SH wave.
-## Python + JIT Optimization (Numba) 
-While based on Python, high-performance parallel processing is achieved using Numba's JIT compilation with CPU multi-threading.
+## Python + JIT Optimization (Numba) with GPU Acceleration
+While based on Python, high-performance parallel processing is achieved using Numba's JIT compilation. The system automatically detects and uses available GPUs (NVIDIA CUDA supported) with fallback to optimized multi-threaded CPU execution.
+
+### Supported Compute Devices
+- **NVIDIA GPU** (CUDA) - Automatic acceleration when available
+- **AMD GPU** (ROCm) - Experimental support
+- **CPU** (Numba JIT) - Optimized multi-threaded fallback
+
+See [GPU_BACKEND.md](GPU_BACKEND.md) for detailed information on GPU support and performance.
 
 # Examples 
 Sample waveform file in np.array format. Analysis procedure was shown in example.py.  
