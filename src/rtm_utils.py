@@ -239,25 +239,33 @@ def apply_absorbing_coeff_stress(sxx, szz, sxz, syx, syz, absorb_coeff):
 # Array Validation and Utilities
 # ============================================================================
 
-@jit(nopython=True, fastmath=True, cache=True)
+@jit(nopython=True, parallel=True, fastmath=True, cache=True)
 def check_array_finite(arr):
     """
     Check if array contains only finite values (no NaN or Inf).
-    Optimized JIT version for fast validation.
+    Optimized JIT version with parallel loops for fast validation.
+    
+    Uses aggressive optimizations:
+    - parallel=True: Multi-threaded checking across rows
+    - fastmath=True: Fast floating-point comparison
     
     Args:
-        arr: Array to check
+        arr: Array to check (nx, nz)
         
     Returns:
-        bool: True if all values are finite
+        bool: True if all values are finite, False otherwise
     """
     nx, nz = arr.shape
-    for i in range(nx):
+    has_invalid = False
+    for i in prange(nx):
+        if has_invalid:
+            break
         for j in range(nz):
             val = arr[i, j]
             if not (val == val and val != np.inf and val != -np.inf):
-                return False
-    return True
+                has_invalid = True
+                break
+    return not has_invalid
 
 @jit(nopython=True, parallel=True, fastmath=True, cache=True)
 def initialize_wavefield_arrays(nx, nz, dtype=np.float64):
@@ -427,17 +435,20 @@ def create_constant_velocity_model(nx, nz, vs, vp, rho):
     
     return vs_arr, vp_arr, rho_arr
 
-@jit(nopython=True, fastmath=True, cache=True)
+@jit(nopython=True, parallel=True, fastmath=True, cache=True)
 def apply_surface_boundary(field, surface_matrix):
     """
     Apply surface boundary condition by zeroing out values above surface.
     
+    Optimized with parallel execution for large grids.
+    Uses fastmath for efficient multiplication.
+    
     Args:
-        field: Wavefield array (modified in-place)
-        surface_matrix: Surface matrix (0 above surface, 1 below)
+        field: Wavefield array (nx, nz) - modified in-place
+        surface_matrix: Surface matrix (nx, nz) - 0 above surface, 1 below
     """
     nx, nz = field.shape
-    for i in range(nx):
+    for i in prange(nx):
         for j in range(nz):
             field[i, j] *= surface_matrix[i, j]
 

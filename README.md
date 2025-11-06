@@ -27,16 +27,56 @@ Sample waveform file in np.array format. Analysis procedure was shown in example
 example rho model　　　　　　　　　　calculated closs-section of example  
 <img src="https://github.com/HaraandYutaro/Reverse-Time-Migration/blob/main/examples/ex%20model/Ex_rhomodel.png" width="300" alt="Sample Image" /> <img src='https://github.com/HaraandYutaro/Reverse-Time-Migration/blob/main/examples/results/RTMimages/y_120.png' width="400" alt="Sample Image" />
 
+# Installation
+
+## Requirements
+
+- Python >= 3.12
+- NumPy >= 1.26.4
+- Numba >= 0.59.0 (with optional CUDA support for GPU acceleration)
+- Matplotlib >= 3.9.2
+- icecream >= 2.1.3 (for improved logging)
+
+## Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### Optional: GPU Support
+
+For NVIDIA GPU acceleration:
+- Install CUDA Toolkit 11.0 or later
+- Numba will automatically detect and use CUDA-capable GPUs
+- See [GPU_BACKEND.md](GPU_BACKEND.md) for detailed GPU setup and performance information
+
 # How to use
+
 **1. Input data**  
  Prepare record waveforms in np.array format  
+ 
 **2. Parameter settings**  
- Set parameters such as the size of the analysis area, sampling rate, wave velocity, and source location (See example.py)  
+ Set parameters such as the size of the analysis area, sampling rate, wave velocity, and source location (See example.py)
+ 
 **3. RTM execution**  
- Call the core functions of RTM using NumPy arrays with Numba JIT acceleration. The wave is propagated forward and backward, and the imaging results are generated according to the imaging conditions (e.g., cross-correlation). The result files are output in npz format  
+ Call the core functions of RTM using NumPy arrays with Numba JIT acceleration. The wave is propagated forward and backward, and the imaging results are generated according to the imaging conditions (e.g., cross-correlation). The result files are output in npz format
+ 
+ Key features:
+ - Automatic GPU acceleration when NVIDIA CUDA is available
+ - Optimized CPU fallback with multi-threaded parallel processing
+ - JIT compilation caches optimized code for faster subsequent runs
+ - Improved logging with icecream for easier debugging
+ 
 **4. Visualization of the results**  
  Load the npz file of the results, apply stacking and surface noise removal as necessary, and draw the reflection cross-section.  
  imaging.py uses matplotlib and other tools to output images
+
+## Performance Tips
+
+- **First run**: JIT compilation takes 5-10 seconds but creates cached code
+- **Subsequent runs**: Use cached optimized code for maximum performance
+- **GPU acceleration**: Automatically used for grids > 256x256 when available
+- **Memory**: Use `rtm_utils.estimate_memory_usage()` to check requirements
 
 # Contributions
 We welcome issues and pull requests at any time. Please feel free to contact us with bug reports, feature requests, etc.

@@ -19,6 +19,7 @@ import numpy as np
 from numba import jit, prange
 import matplotlib.pyplot as plt
 import copy
+from icecream import ic
 # Import common RTM utilities
 from rtm_utils import (
     compute_shear_avg_SH, compute_shear_avg_PSV, compute_rho_staggered,
@@ -26,6 +27,9 @@ from rtm_utils import (
     apply_absorbing_coeff_stress, check_array_finite, compute_cross_correlation
 )
 plt.style.use('fast')
+
+# Configure icecream for better logging
+ic.configureOutput(prefix='[Backward] ', includeContext=True)
 
 # JIT-optimized functions for performance with aggressive optimizations
 @jit(nopython=True, parallel=True, fastmath=True, cache=True, inline='always')
@@ -171,46 +175,63 @@ class backward_modeling:
         self.steepness_array = kwargs['steepness_array'] if 'steepness_array' in kwargs else None 
 
     def initialize(self):
+        """
+        Initialize backward modeling with optimized pre-computations.
+        
+        This method:
+        1. Initializes wavefield arrays (velocity and stress)
+        2. Computes elastic parameters (mu, lambda) from velocity model
+        3. Applies harmonic averaging for staggered grid
+        4. Pre-computes reciprocals (inv_dx, inv_dz, dt/rho) for optimal performance
+        5. Generates absorbing boundary coefficients
+        
+        All array operations use JIT-compiled functions with parallel=True and fastmath=True.
+        """
+        ic("Initializing backward modeling")
+        ic(self.nx, self.nz, self.nt)
+        
         self.synsrc_u = np.zeros((len(self.src_loc), self.nt), dtype=np.float64)
         self.synsrc_v = np.zeros((len(self.src_loc), self.nt), dtype=np.float64)
         self.synsrc_w = np.zeros((len(self.src_loc), self.nt), dtype=np.float64)
 
+        # Compute elastic parameters
         self.mu = self.rho*self.vs**2
         self.lam = ((self.vp/self.vs)**2 - 2)*self.mu
         self.dt = 1 / self.fs
+        ic("Elastic parameters computed")
+        ic(self.dt)
 
-        # stress
-        # for p-sv wave propagation, sxx, sxz, szz
+        # Initialize wavefield arrays (velocity and stress)
         self.sxx = np.zeros((self.nx, self.nz), dtype=np.float64)
         self.sxz = np.zeros((self.nx, self.nz), dtype=np.float64)
         self.szz = np.zeros((self.nx, self.nz), dtype=np.float64)
-        # for sh wave propagation, syx, syz
         self.syx = np.zeros((self.nx, self.nz), dtype=np.float64)
         self.syz = np.zeros((self.nx, self.nz), dtype=np.float64)
-
-        # velocity
-        # u, v, w for each x,y,z,axis
         self.u = np.zeros((self.nx, self.nz), dtype=np.float64)
         self.v = np.zeros((self.nx, self.nz), dtype=np.float64)
         self.w = np.zeros((self.nx, self.nz), dtype=np.float64)
 
-        # Use optimized JIT functions for averaging operations
+        # Apply optimized JIT functions for material property averaging
+        ic("Computing harmonic averages for staggered grid")
         self.myx, self.myz = compute_shear_avg_SH(self.mu)
         self.mxz = compute_shear_avg_PSV(self.mu)
-
-        # Compute staggered grid densities in one pass
         self.rho_u, self.rho_w = compute_rho_staggered(self.rho)
 
-        # Pre-compute reciprocals and dt/rho for optimal performance
+        # Pre-compute reciprocals for optimal performance (eliminates divisions in inner loops)
+        ic("Pre-computing reciprocals and dt/rho arrays")
         self.inv_dx = 1.0 / self.dx
         self.inv_dz = 1.0 / self.dz
-        self.neg_dt = -self.dt  # Pre-negate for stress update
+        self.neg_dt = -self.dt  # Pre-negated for backward propagation
         self.dt_rho_u, self.dt_rho_w, self.dt_rho = precompute_dt_over_rho(
             self.dt, self.rho_u, self.rho_w, self.rho
         )
         
-        # absorbing coefficient computed with optimized function
+        # Generate absorbing boundary coefficients
+        ic("Computing absorbing boundary coefficients")
+        ic(self.absorbing_frame)
         self.absorb_coeff = compute_absorbing_coeff(self.nx, self.nz, self.absorbing_frame)
+        
+        ic("Backward modeling initialization complete")
 
         ## obsdata scaling
         gain = 16

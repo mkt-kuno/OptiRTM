@@ -21,12 +21,16 @@ import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for environments without display
 import matplotlib.pyplot as plt
 import os
+from icecream import ic
 # Import common RTM utilities
 from rtm_utils import (
     compute_shear_avg_SH, compute_shear_avg_PSV, compute_rho_staggered,
     precompute_dt_over_rho, compute_absorbing_coeff, apply_absorbing_coeff,
     apply_absorbing_coeff_stress, check_array_finite, gaussian_source_wavelet
 )
+
+# Configure icecream for better logging
+ic.configureOutput(prefix='[Forward] ', includeContext=True)
 
 # Highly optimized JIT functions for forward modeling
 @jit(nopython=True, parallel=True, fastmath=True, cache=True, inline='always')
@@ -166,53 +170,85 @@ class forward_modeling:
         self.steepness_array = kwargs['steepness_array'] if 'steepness_array' in kwargs else None
 
     def initialize(self):
+        """
+        Initialize forward modeling with optimized pre-computations.
+        
+        This method:
+        1. Initializes seismogram arrays for recording at receivers
+        2. Computes elastic parameters (mu, lambda) from velocity model
+        3. Initializes wavefield arrays (velocity and stress)
+        4. Applies harmonic averaging for staggered grid
+        5. Pre-computes reciprocals (inv_dx, inv_dz, dt/rho) for optimal performance
+        6. Generates absorbing boundary coefficients
+        7. Initializes source wavelets
+        
+        All array operations use JIT-compiled functions with parallel=True and fastmath=True.
+        """
+        ic("Initializing forward modeling")
+        ic(self.nx, self.nz, self.nt)
+        
         self.seismogram_u = np.zeros((len(self.receiver_loc), self.nt), dtype=np.float32)
         self.seismogram_v = np.zeros((len(self.receiver_loc), self.nt), dtype=np.float32)
         self.seismogram_w = np.zeros((len(self.receiver_loc), self.nt), dtype=np.float32)
 
+        # Compute elastic parameters
         self.mu = self.rho*self.vs**2
         self.lam = ((self.vp/self.vs)**2 - 2)*self.mu
         self.dt = 1 / self.fs
+        ic("Elastic parameters computed")
+        ic(self.dt)
 
-        # stress
-        # for p-sv wave propagation, sxx, sxz, szz
+        # Initialize wavefield arrays (velocity and stress)
         self.sxx = np.zeros((self.nx, self.nz), dtype=np.float32)
         self.sxz = np.zeros((self.nx, self.nz), dtype=np.float32)
         self.szz = np.zeros((self.nx, self.nz), dtype=np.float32)
-        # for sh wave propagation, syx, syz
         self.syx = np.zeros((self.nx, self.nz), dtype=np.float32)
         self.syz = np.zeros((self.nx, self.nz), dtype=np.float32)
-
-        # velocity
-        # u, v, w for each x,y,z,axis
         self.u = np.zeros((self.nx, self.nz), dtype=np.float32)
         self.v = np.zeros((self.nx, self.nz), dtype=np.float32)
         self.w = np.zeros((self.nx, self.nz), dtype=np.float32)
 
-        # Use optimized JIT functions for all preprocessing
+        # Apply optimized JIT functions for material property averaging
+        ic("Computing harmonic averages for staggered grid")
         self.myx, self.myz = compute_shear_avg_SH(self.mu)
         self.mxz = compute_shear_avg_PSV(self.mu)
-
-        # Compute staggered grid densities in one pass
         self.rho_u, self.rho_w = compute_rho_staggered(self.rho)
 
-        # Pre-compute reciprocals for optimal performance
+        # Pre-compute reciprocals for optimal performance (eliminates divisions in inner loops)
+        ic("Pre-computing reciprocals and dt/rho arrays")
         self.inv_dx = 1.0 / self.dx
         self.inv_dz = 1.0 / self.dz
         self.dt_rho_u, self.dt_rho_w, self.dt_rho = precompute_dt_over_rho(
             self.dt, self.rho_u, self.rho_w, self.rho
         )
         
-        # Optimized absorbing coefficient
+        # Generate absorbing boundary coefficients
+        ic("Computing absorbing boundary coefficients")
+        ic(self.absorbing_frame)
         self.absorb_coeff = compute_absorbing_coeff(self.nx, self.nz, self.absorbing_frame)
 
+        # Initialize source wavelets
+        ic("Initializing source wavelets")
         self.wavelet_u = self.initialize_wavelet(self.wavelet_u)
         self.wavelet_v = self.initialize_wavelet(self.wavelet_v)
         self.wavelet_w = self.initialize_wavelet(self.wavelet_w)
+        
+        ic("Forward modeling initialization complete")
     
     def initialize_wavelet(self, wavelet, show=False):
+        """
+        Initialize source wavelet with automatic generation or validation.
+        
+        Args:
+            wavelet: Input wavelet array or None for auto-generation
+            show: Display wavelet plot if True
+            
+        Returns:
+            wavelets: Initialized wavelet array (n_sources, nt)
+        """
         if wavelet is None:
-            print('wavelet is None. make gaussian source of f0 = ', self.f0)
+            ic("Generating Gaussian source wavelet")
+            ic(self.f0, len(self.src_loc))
             wavelets = np.zeros((len(self.src_loc), self.nt), dtype = np.float32)
             for i, src in enumerate(self.src_loc):
                 wavelets[i,:] = self._gaussian_src(self.f0)
@@ -223,13 +259,14 @@ class forward_modeling:
                     plt.show()
         else:
             if wavelet.shape[0] != len(self.src_loc):
-                raise ValueError('wavelet shape is not match with src_loc')
+                raise ValueError(f'wavelet shape {wavelet.shape[0]} does not match src_loc {len(self.src_loc)}')
             if wavelet.shape[1] != self.nt:
-                print('wavelet shape is different to simulation duration. zero padding or cut')
+                ic("Adjusting wavelet duration")
+                ic(wavelet.shape[1], self.nt)
                 if wavelet.shape[1] > self.nt:
-                    wavelets = wavelet[:, :self.nt]
+                    wavelets = wavelet[:, :self.nt]  # Truncate
                 else:
-                    wavelets = np.pad(wavelet, ((0, 0), (0, self.nt - wavelet.shape[1])), mode='constant')
+                    wavelets = np.pad(wavelet, ((0, 0), (0, self.nt - wavelet.shape[1])), mode='constant')  # Zero pad
             else:
                 wavelets = wavelet
         return wavelets
