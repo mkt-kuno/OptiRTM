@@ -17,11 +17,22 @@
 # 1. 順方向モデリング
 import numpy as np
 from numba import jit, prange
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for environments without display
-import matplotlib.pyplot as plt
 import os
 from icecream import ic
+
+# Matplotlib is optional - only import if needed for visualization
+_plt = None
+_matplotlib = None
+def _ensure_matplotlib():
+    """Lazy import matplotlib only when needed"""
+    global _plt, _matplotlib
+    if _plt is None:
+        import matplotlib
+        matplotlib.use('Agg')  # Non-interactive backend for environments without display
+        import matplotlib.pyplot as plt
+        _matplotlib = matplotlib
+        _plt = plt
+    return _plt
 # Import common RTM utilities
 from rtm_utils import (
     compute_shear_avg_SH, compute_shear_avg_PSV, compute_rho_staggered,
@@ -168,6 +179,9 @@ class forward_modeling:
         self.receivers_height = kwargs['receivers_height'] if 'receivers_height' in kwargs else None ##
         self.surface_matrix = kwargs['surface_matrix'] if 'surface_matrix' in kwargs else None
         self.steepness_array = kwargs['steepness_array'] if 'steepness_array' in kwargs else None
+        # Visualization control parameters
+        self.enable_matplotlib = kwargs.get('enable_matplotlib', True)  # Enable matplotlib by default for backward compatibility
+        self.plot_callback = kwargs.get('plot_callback', None)  # Optional callback for custom visualization
 
     def initialize(self):
         """
@@ -253,10 +267,14 @@ class forward_modeling:
             for i, src in enumerate(self.src_loc):
                 wavelets[i,:] = self._gaussian_src(self.f0)
                 if show:
-                    plt.figure(figsize=(5, 4))
-                    plt.plot(wavelets[i,:])
-                    plt.title('source wavelet')
-                    plt.show()
+                    if self.plot_callback:
+                        self.plot_callback('wavelet', wavelets[i,:], title='source wavelet')
+                    elif self.enable_matplotlib:
+                        plt = _ensure_matplotlib()
+                        plt.figure(figsize=(5, 4))
+                        plt.plot(wavelets[i,:])
+                        plt.title('source wavelet')
+                        plt.show()
         else:
             if wavelet.shape[0] != len(self.src_loc):
                 raise ValueError(f'wavelet shape {wavelet.shape[0]} does not match src_loc {len(self.src_loc)}')
@@ -272,6 +290,10 @@ class forward_modeling:
         return wavelets
     
     def plot_wavefield(self):
+        if not self.enable_matplotlib:
+            return
+        
+        plt = _ensure_matplotlib()
         # 波動場の初期プロットを設定
         u_cpu = np.asarray(self.u).T
         v_cpu = np.asarray(self.v).T
@@ -313,10 +335,24 @@ class forward_modeling:
         plt.show(block=False)
 
     def display_wavefield(self):
+        if not self.enable_matplotlib:
+            return
+        
         # 波動場データを更新
         u_cpu = self.u
         v_cpu = self.v
         w_cpu = self.w
+
+        # Use callback if provided
+        if self.plot_callback:
+            self.plot_callback('wavefield', {'u': u_cpu, 'v': v_cpu, 'w': w_cpu})
+            return
+
+        # Check if image objects exist (plot_wavefield must be called first)
+        if not hasattr(self, 'im_u') or not hasattr(self, 'im_v') or not hasattr(self, 'im_w'):
+            # If matplotlib is enabled but plot not initialized, silently return
+            # plot_wavefield() must be called before display_wavefield()
+            return
 
         # イメージのデータを更新
         self.im_u.set_data(u_cpu.T)
@@ -620,6 +656,15 @@ class forward_modeling:
         return 0
 
     def show_seismogram(self, seismogram_cpu, title = 'seismogram'):
+        # Use callback if provided
+        if self.plot_callback:
+            self.plot_callback('seismogram', seismogram_cpu, title=title)
+            return
+
+        if not self.enable_matplotlib:
+            return
+
+        plt = _ensure_matplotlib()
         fig, axes = plt.subplots(len(seismogram_cpu),1, figsize=(5,4), sharey=False)
         for i in range(len(seismogram_cpu)):
             axes[i].plot(seismogram_cpu[i])

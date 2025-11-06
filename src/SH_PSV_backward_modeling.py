@@ -17,16 +17,26 @@
 # 1. backward modeling
 import numpy as np
 from numba import jit, prange
-import matplotlib.pyplot as plt
 import copy
 from icecream import ic
+
+# Matplotlib is optional - only import if needed for visualization
+_plt = None
+def _ensure_matplotlib():
+    """Lazy import matplotlib only when needed"""
+    global _plt
+    if _plt is None:
+        import matplotlib.pyplot as plt
+        plt.style.use('fast')
+        _plt = plt
+    return _plt
+
 # Import common RTM utilities
 from rtm_utils import (
     compute_shear_avg_SH, compute_shear_avg_PSV, compute_rho_staggered,
     precompute_dt_over_rho, compute_absorbing_coeff, apply_absorbing_coeff,
     apply_absorbing_coeff_stress, check_array_finite, compute_cross_correlation
 )
-plt.style.use('fast')
 
 # Configure icecream for better logging
 ic.configureOutput(prefix='[Backward] ', includeContext=True)
@@ -140,6 +150,14 @@ class backward_modeling:
         """
         v:np.ndarray 途中経過の波場スナップショット
         """
+        if self.plot_callback:
+            self.plot_callback('wavefield_snapshot', v.T, title=suptitle)
+            return
+        
+        if not self.enable_matplotlib:
+            return
+        
+        plt = _ensure_matplotlib()
         mvmax = np.max(v)
         plt.figure(figsize=(8, 7))
         plt.imshow(v.T, aspect='equal', cmap='seismic', interpolation='nearest',vmin=-mvmax, vmax=mvmax)
@@ -167,6 +185,9 @@ class backward_modeling:
         self.order = kwargs['order']if 'order'in kwargs else 2
         self.receivers_height = kwargs['receivers_height'] if 'receivers_height' in kwargs else None
         self.surface_matrix = kwargs['surface_matrix'] if 'surface_matrix' in kwargs else None
+        # Visualization control parameters
+        self.enable_matplotlib = kwargs.get('enable_matplotlib', True)  # Enable matplotlib by default for backward compatibility
+        self.plot_callback = kwargs.get('plot_callback', None)  # Optional callback for custom visualization
 
         if self.surface_matrix is not None:
             if self.surface_matrix.shape != (self.nx, self.nz):
@@ -243,6 +264,10 @@ class backward_modeling:
         # self.obsdata_w = self.obsdata_w *(maxV / gain / ms_V) #maxAD too small so calculate finally
 
     def plot_wavefield(self):
+        if not self.enable_matplotlib:
+            return
+        
+        plt = _ensure_matplotlib()
         # 波動場の初期プロットを設定
         u_cpu = np.asarray(self.u).T
         v_cpu = np.asarray(self.v).T
@@ -284,11 +309,27 @@ class backward_modeling:
         you can choose the wavefield to display setting u_cpu, v_cpu, w_cpu
             
         """
+        if not self.enable_matplotlib:
+            return
+        
         # 波動場データを更新
-        plt.suptitle(suptitle)
         u_cpu = self.u if u_cpu is None else u_cpu
         v_cpu = self.v if v_cpu is None else v_cpu
         w_cpu = self.w if w_cpu is None else w_cpu
+
+        # Use callback if provided
+        if self.plot_callback:
+            self.plot_callback('wavefield', {'u': u_cpu, 'v': v_cpu, 'w': w_cpu}, title=suptitle)
+            return
+
+        # Check if image objects exist (plot_wavefield must be called first)
+        if not hasattr(self, 'im_u') or not hasattr(self, 'im_v') or not hasattr(self, 'im_w'):
+            # If matplotlib is enabled but plot not initialized, silently return
+            # plot_wavefield() must be called before display_wavefield()
+            return
+
+        plt = _ensure_matplotlib()
+        plt.suptitle(suptitle)
 
         # イメージのデータを更新
         self.im_u.set_data(u_cpu.T)
@@ -602,7 +643,14 @@ class backward_modeling:
         return 0
 
     def show_src(self):
-
+        if self.plot_callback:
+            self.plot_callback('source', {'u': self.synsrc_u[0, :], 'v': self.synsrc_v[0, :], 'w': self.synsrc_w[0, :]})
+            return
+        
+        if not self.enable_matplotlib:
+            return
+        
+        plt = _ensure_matplotlib()
         plt.figure(figsize=(8, 7))
         plt.plot(self.synsrc_u[0, :], label='u')
         plt.plot(self.synsrc_v[0, :], label='v')

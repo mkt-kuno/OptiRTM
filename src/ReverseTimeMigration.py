@@ -25,8 +25,17 @@ import SH_PSV_forward_modelng as fw
 import SH_PSV_backward_modeling as bk
 import numpy as np
 import os 
-import matplotlib.pyplot as plt
-plt.style.use('fast')
+
+# Matplotlib is optional - only import if needed for visualization
+_plt = None
+def _ensure_matplotlib():
+    """Lazy import matplotlib only when needed"""
+    global _plt
+    if _plt is None:
+        import matplotlib.pyplot as plt
+        plt.style.use('fast')
+        _plt = plt
+    return _plt
 """
 RTMの考え方 Claerbout(1971)
 「地中の反射体は、下向き伝搬波の初到達時刻が上向き伝搬波の時刻と一致する地点に存在する」
@@ -43,6 +52,9 @@ class ReverseTimeMigration:
     assume one source because of the v estimation
     """
     def __init__(self, **kwargs):
+        # Visualization control parameters
+        self.enable_matplotlib = kwargs.get('enable_matplotlib', True)  # Enable matplotlib by default for backward compatibility
+        self.plot_callback = kwargs.get('plot_callback', None)  # Optional callback for custom visualization
         # 1. import observing data and source function
         self.observed_u = kwargs['observed_u'] if 'observed_u' in kwargs else None        
         self.observed_v = kwargs['observed_v'] if 'observed_v' in kwargs else None
@@ -247,13 +259,20 @@ class ReverseTimeMigration:
                 self.steepness_array = steepness_array
 
                 if self.debug:
-                    plt.plot(height_array)
-                    plt.title('Surface Shape')
-                    plt.show()
+                    if self.plot_callback:
+                        # Use callback for custom visualization
+                        self.plot_callback('height_array', height_array, title='Surface Shape')
+                        self.plot_callback('surface_matrix', surface_matrix.T, title='Surface Matrix')
+                    elif self.enable_matplotlib:
+                        # Use matplotlib for visualization
+                        plt = _ensure_matplotlib()
+                        plt.plot(height_array)
+                        plt.title('Surface Shape')
+                        plt.show()
 
-                    plt.imshow(surface_matrix.T)
-                    plt.title('Surface Matrix')
-                    plt.show()
+                        plt.imshow(surface_matrix.T)
+                        plt.title('Surface Matrix')
+                        plt.show()
 
                 self.surface_matrix = surface_matrix
                 # set source location_steps
@@ -283,7 +302,9 @@ class ReverseTimeMigration:
                                        isnap = isnap,
                                        receivers_height = receivers_height,
                                        surface_matrix = surface_matrix,
-                                       steepness_array = steepness_array
+                                       steepness_array = steepness_array,
+                                       enable_matplotlib = self.enable_matplotlib,
+                                       plot_callback = self.plot_callback
                                        )
             flag = _fw.run(show=self.debug,save=True) # if error, run returns 1 or 2 ro 3
 
@@ -311,7 +332,9 @@ class ReverseTimeMigration:
                                         isnap = _fw.isnaps,
                                         receivers_height = receivers_height,
                                         surface_matrix = surface_matrix,
-                                        steepness_array = steepness_array
+                                        steepness_array = steepness_array,
+                                        enable_matplotlib = self.enable_matplotlib,
+                                        plot_callback = self.plot_callback
                                         ) # isnap is 
             flag = _bw.run_calc(show = self.debug,
                                 import_fwdata_u = _fw.u_save,
@@ -406,6 +429,26 @@ class ReverseTimeMigration:
         umax = np.max(umap) if np.max(umap) > -np.min(umap) else -np.min(umap)
         vmax = np.max(vmap) if np.max(vmap) > -np.min(vmap) else -np.min(vmap)
         wmax = np.max(wmap) if np.max(wmap) > -np.min(wmap) else -np.min(wmap)
+
+        # Prepare visualization data
+        viz_data = {
+            'umap': umap, 'vmap': vmap, 'wmap': wmap,
+            'umax': umax, 'vmax': vmax, 'wmax': wmax,
+            'extent': [xmin, xmax, zmax, zmin],
+            'cmap': cmap
+        }
+
+        # Use callback if provided
+        if self.plot_callback:
+            self.plot_callback('result', viz_data, save=save, dir=dir, savename=savename)
+            return
+
+        # Use matplotlib if enabled
+        if not self.enable_matplotlib:
+            print("Matplotlib is disabled. Use plot_callback to visualize results or enable matplotlib.")
+            return
+
+        plt = _ensure_matplotlib()
 
         # 図とサブプロットを作成
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
