@@ -34,7 +34,7 @@ example rho model　　　　　　　　　　calculated closs-section of examp
 - Python >= 3.12
 - NumPy >= 1.26.4
 - Numba >= 0.59.0 (with optional CUDA support for GPU acceleration)
-- Matplotlib >= 3.9.2
+- Matplotlib >= 3.9.2 (optional - can be disabled, see [Matplotlib Usage Control](MATPLOTLIB_USAGE.md))
 - icecream >= 2.1.3 (for improved logging)
 
 ## Install Dependencies
@@ -66,10 +66,11 @@ For NVIDIA GPU acceleration:
  - Optimized CPU fallback with multi-threaded parallel processing
  - JIT compilation caches optimized code for faster subsequent runs
  - Improved logging with icecream for easier debugging
+ - **Optional matplotlib usage** - can run without matplotlib or use custom visualization callbacks (see [Matplotlib Usage Control](MATPLOTLIB_USAGE.md))
  
 **4. Visualization of the results**  
  Load the npz file of the results, apply stacking and surface noise removal as necessary, and draw the reflection cross-section.  
- imaging.py uses matplotlib and other tools to output images
+ imaging.py uses matplotlib and other tools to output images. Alternatively, you can disable matplotlib and use custom visualization - see [Matplotlib Usage Control](MATPLOTLIB_USAGE.md) for details.
 
 ## Performance Tips
 
