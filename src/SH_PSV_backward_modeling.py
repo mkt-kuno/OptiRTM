@@ -322,6 +322,12 @@ class backward_modeling:
             self.plot_callback('wavefield', {'u': u_cpu, 'v': v_cpu, 'w': w_cpu}, title=suptitle)
             return
 
+        # Check if image objects exist (plot_wavefield must be called first)
+        if not hasattr(self, 'im_u') or not hasattr(self, 'im_v') or not hasattr(self, 'im_w'):
+            # If matplotlib is enabled but plot not initialized, silently return
+            # plot_wavefield() must be called before display_wavefield()
+            return
+
         plt = _ensure_matplotlib()
         plt.suptitle(suptitle)
 

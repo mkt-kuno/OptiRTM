@@ -348,6 +348,12 @@ class forward_modeling:
             self.plot_callback('wavefield', {'u': u_cpu, 'v': v_cpu, 'w': w_cpu})
             return
 
+        # Check if image objects exist (plot_wavefield must be called first)
+        if not hasattr(self, 'im_u') or not hasattr(self, 'im_v') or not hasattr(self, 'im_w'):
+            # If matplotlib is enabled but plot not initialized, silently return
+            # plot_wavefield() must be called before display_wavefield()
+            return
+
         # イメージのデータを更新
         self.im_u.set_data(u_cpu.T)
         self.im_v.set_data(v_cpu.T)
