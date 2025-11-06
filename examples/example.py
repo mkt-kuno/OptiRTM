@@ -1,7 +1,6 @@
 import sys
 sys.path.append('src/')
 import ReverseTimeMigration as RT
-import cupy as cp
 import numpy as np
 import os
 import glob
@@ -27,16 +26,16 @@ def get_source_ch(distance:np.array, source_x):
 """
 Reverse time migration set-up
 parameters:
-    observed_u: cupy.array, observed velocity data in x-axis
-    observed_v: cupy.array, observed velocity data in y-axis
-    observed_w: cupy.array, observed velocity data in z-axis
+    observed_u: numpy.array, observed velocity data in x-axis
+    observed_v: numpy.array, observed velocity data in y-axis
+    observed_w: numpy.array, observed velocity data in z-axis
 
-    source_u: cupy.array, source velocity data in x-axis
-    source_v: cupy.array, source velocity data in y-axis
-    source_w: cupy.array, source velocity data in z-axis
+    source_u: numpy.array, source velocity data in x-axis
+    source_v: numpy.array, source velocity data in y-axis
+    source_w: numpy.array, source velocity data in z-axis
 
-    receiver_loc: cupy.array, sensor position in x-axis
-    source_loc: cupy.array, source position in x-axis
+    receiver_loc: numpy.array, sensor position in x-axis
+    source_loc: numpy.array, source position in x-axis
 
     velocity: float, velocity of the medium
     fs: float, sampling frequency of acquisition data
@@ -82,10 +81,10 @@ for npz_path in npzs_path_list:
     npz = np.load(npz_path)
     distance = npz['distance']
     source_x = npz['source_x']
-    source_ch = cp.int32(get_source_ch(distance, source_x))
-    receiver_loc = cp.array(distance)
-    source_loc = cp.array(source_x)
-    fs = cp.float32(sampling_freq)
+    source_ch = np.int32(get_source_ch(distance, source_x))
+    receiver_loc = np.array(distance)
+    source_loc = np.array(source_x)
+    fs = np.float32(sampling_freq)
 
     observed_u = npz['x'][:, :int(fs*time_to)]
     source_u = npz['x'][source_ch][0:int(fs*time_to)]
@@ -95,12 +94,12 @@ for npz_path in npzs_path_list:
     source_w = npz['z'][source_ch][0:int(fs*time_to)]
 
     # set data
-    observed_u = cp.array(observed_u)
-    source_u = cp.array(source_u)
-    observed_v = cp.array(observed_v)
-    source_v = cp.array(source_v)
-    observed_w = cp.array(observed_w)
-    source_w = cp.array(source_w)
+    observed_u = np.array(observed_u)
+    source_u = np.array(source_u)
+    observed_v = np.array(observed_v)
+    source_v = np.array(source_v)
+    observed_w = np.array(observed_w)
+    source_w = np.array(source_w)
 
     RTM = RT.ReverseTimeMigration(observed_u = observed_u,
                                 observed_v = observed_v,

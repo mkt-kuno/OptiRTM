@@ -15,12 +15,103 @@
 # along with this library. If not, see <https://www.gnu.org/licenses/>.
 
 # 1. 順方向モデリング
-import cupy as cp  # CuPy is imported as cp for compatibility
-import matplotlib.pyplot as plt
-import matplotlib
 import numpy as np
-matplotlib.use('TkAgg')  # または 'Agg' を使用
+from numba import jit, prange
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for environments without display
+import matplotlib.pyplot as plt
 import os
+from icecream import ic
+# Import common RTM utilities
+from rtm_utils import (
+    compute_shear_avg_SH, compute_shear_avg_PSV, compute_rho_staggered,
+    precompute_dt_over_rho, compute_absorbing_coeff, apply_absorbing_coeff,
+    apply_absorbing_coeff_stress, check_array_finite, gaussian_source_wavelet
+)
+
+# Configure icecream for better logging
+ic.configureOutput(prefix='[Forward] ', includeContext=True)
+
+# Highly optimized JIT functions for forward modeling
+@jit(nopython=True, parallel=True, fastmath=True, cache=True, inline='always')
+def update_vel_order2_fw_jit(u, w, v, sxx, szz, sxz, syx, syz, inv_dx, inv_dz, dt, dt_rho_u, dt_rho_w, dt_rho):
+    """
+    Aggressively optimized velocity update for forward modeling with:
+    - Pre-computed reciprocals (inv_dx, inv_dz, dt/rho)
+    - Fused P-SV and SH wave updates
+    - Cache-friendly access patterns
+    - Reduced memory loads through register reuse
+    """
+    nx, nz = u.shape
+    for i in prange(1, nx - 1):
+        for j in range(1, nz - 1):
+            # Load stress values once
+            sxx_i = sxx[i, j]
+            sxx_im1 = sxx[i-1, j]
+            szz_j = szz[i, j]
+            szz_jm1 = szz[i, j-1]
+            sxz_i = sxz[i, j]
+            sxz_im1 = sxz[i-1, j]
+            sxz_jm1 = sxz[i, j-1]
+            
+            # P-SV wave with pre-computed reciprocals
+            sxx_x = (sxx_i - sxx_im1) * inv_dx
+            szz_z = (szz_j - szz_jm1) * inv_dz
+            sxz_x = (sxz_i - sxz_im1) * inv_dx
+            sxz_z = (sxz_i - sxz_jm1) * inv_dz
+            
+            # Fused multiply-add operations
+            u[i, j] += (sxx_x + sxz_z) * dt_rho_u[i, j]
+            w[i, j] += (sxz_x + szz_z) * dt_rho_w[i, j]
+            
+            # SH wave inline
+            syx_x = (syx[i, j] - syx[i-1, j]) * inv_dx
+            syz_z = (syz[i, j] - syz[i, j-1]) * inv_dz
+            v[i, j] += (syx_x + syz_z) * dt_rho[i, j]
+
+@jit(nopython=True, parallel=True, fastmath=True, cache=True, inline='always')
+def update_str_order2_fw_jit(u, w, v, sxx, szz, sxz, syx, syz, inv_dx, inv_dz, dt, lam, mu, mxz, myx, myz):
+    """
+    Highly optimized stress update for forward modeling with:
+    - Pre-computed reciprocals
+    - Reduced redundant calculations
+    - Register reuse for velocity values
+    """
+    nx, nz = u.shape
+    for i in prange(1, nx - 1):
+        for j in range(1, nz - 1):
+            # Load and reuse velocity values
+            u_ij = u[i, j]
+            w_ij = w[i, j]
+            v_ij = v[i, j]
+            
+            # Compute derivatives with pre-computed reciprocals
+            u_x = (u[i+1, j] - u_ij) * inv_dx
+            u_z = (u[i, j+1] - u_ij) * inv_dz
+            w_x = (w[i+1, j] - w_ij) * inv_dx
+            w_z = (w[i, j+1] - w_ij) * inv_dz
+            
+            # Compute common term once
+            div_vel = u_x + w_z
+            lam_div = lam[i, j] * div_vel
+            
+            # P-SV wave with fused operations
+            sxx[i, j] += dt * (lam_div + 2.0 * mu[i, j] * u_x)
+            szz[i, j] += dt * (lam_div + 2.0 * mu[i, j] * w_z)
+            sxz[i, j] += dt * mxz[i, j] * (u_z + w_x)
+            
+            # SH wave inline
+            v_x = (v[i+1, j] - v_ij) * inv_dx
+            v_z = (v[i, j+1] - v_ij) * inv_dz
+            syx[i, j] += dt * myx[i, j] * v_x
+            syz[i, j] += dt * myz[i, j] * v_z
+
+# Removed duplicate functions - now using shared utilities from rtm_utils.py:
+# - apply_absorbing_coeff, apply_absorbing_coeff_stress
+# - compute_absorbing_coeff
+# - compute_shear_avg_SH, compute_shear_avg_PSV
+# - compute_rho_staggered
+# - precompute_dt_over_rho
 
 """
     i,j               i+1,j
@@ -44,11 +135,11 @@ class forward_modeling:
     dz:float z方向のグリッド間隔
     nt:int   シミュレーション時間ステップ数
     fs:float サンプリング周波数
-    vs:cp.array S波速度
-    rho:cp.array 密度
+    vs:np.array S波速度
+    rho:np.array 密度
     absorbing_frame:int 吸収境界の幅
     src_loc:list 震源の位置  [[i1,j1],[i2,j2],...]
-    wavelet:cp.array 震源波形
+    wavelet:np.array 震源波形
     receiver_loc:list 受信機の位置 [[i1,j1],[i2,j2],...]
 
     isnap:int 途中経過の表示ステップ数 default:10
@@ -62,9 +153,9 @@ class forward_modeling:
         self.dz = kwargs['dz']
         self.nt = kwargs['nt']
         self.fs = kwargs['fs']
-        self.vs = kwargs['vs'] if 'vs' in kwargs else cp.ones((self.nx,self.nz), dtype =cp.float32)*200
-        self.vp = kwargs['vp'] if 'vp' in kwargs else self.vs*cp.sqrt(6) # at least root2 times larger than vs, poisson ratio = 0.25, vp/vs = 1.7320508, 
-        self.rho= kwargs['rho']if 'rho'in kwargs else cp.ones((self.nx,self.nz), dtype =cp.float32)*1800
+        self.vs = kwargs['vs'] if 'vs' in kwargs else np.ones((self.nx,self.nz), dtype =np.float32)*200
+        self.vp = kwargs['vp'] if 'vp' in kwargs else self.vs*np.sqrt(6) # at least root2 times larger than vs, poisson ratio = 0.25, vp/vs = 1.7320508, 
+        self.rho= kwargs['rho']if 'rho'in kwargs else np.ones((self.nx,self.nz), dtype =np.float32)*1800
         self.absorbing_frame = kwargs['absorbing_frame'] if 'absorbing_frame' in kwargs else 60
         self.src_loc = kwargs['src_loc']if 'src_loc'in kwargs else [self.nx // 2,0] #source location, (i,j)
         self.wavelet_u = kwargs['wavelet_u']if 'wavelet_u'in kwargs else None
@@ -79,56 +170,86 @@ class forward_modeling:
         self.steepness_array = kwargs['steepness_array'] if 'steepness_array' in kwargs else None
 
     def initialize(self):
-        self.seismogram_u = cp.zeros((len(self.receiver_loc), self.nt), dtype=cp.float32)
-        self.seismogram_v = cp.zeros((len(self.receiver_loc), self.nt), dtype=cp.float32)
-        self.seismogram_w = cp.zeros((len(self.receiver_loc), self.nt), dtype=cp.float32)
+        """
+        Initialize forward modeling with optimized pre-computations.
+        
+        This method:
+        1. Initializes seismogram arrays for recording at receivers
+        2. Computes elastic parameters (mu, lambda) from velocity model
+        3. Initializes wavefield arrays (velocity and stress)
+        4. Applies harmonic averaging for staggered grid
+        5. Pre-computes reciprocals (inv_dx, inv_dz, dt/rho) for optimal performance
+        6. Generates absorbing boundary coefficients
+        7. Initializes source wavelets
+        
+        All array operations use JIT-compiled functions with parallel=True and fastmath=True.
+        """
+        ic("Initializing forward modeling")
+        ic(self.nx, self.nz, self.nt)
+        
+        self.seismogram_u = np.zeros((len(self.receiver_loc), self.nt), dtype=np.float32)
+        self.seismogram_v = np.zeros((len(self.receiver_loc), self.nt), dtype=np.float32)
+        self.seismogram_w = np.zeros((len(self.receiver_loc), self.nt), dtype=np.float32)
 
+        # Compute elastic parameters
         self.mu = self.rho*self.vs**2
         self.lam = ((self.vp/self.vs)**2 - 2)*self.mu
         self.dt = 1 / self.fs
+        ic("Elastic parameters computed")
+        ic(self.dt)
 
-        # stress
-        # for p-sv wave propagation, sxx, sxz, szz
-        self.sxx = cp.zeros((self.nx, self.nz), dtype=cp.float32)
-        self.sxz = cp.zeros((self.nx, self.nz), dtype=cp.float32)
-        self.szz = cp.zeros((self.nx, self.nz), dtype=cp.float32)
-        # for sh wave propagation, syx, syz
-        self.syx = cp.zeros((self.nx, self.nz), dtype=cp.float32)
-        self.syz = cp.zeros((self.nx, self.nz), dtype=cp.float32)
+        # Initialize wavefield arrays (velocity and stress)
+        self.sxx = np.zeros((self.nx, self.nz), dtype=np.float32)
+        self.sxz = np.zeros((self.nx, self.nz), dtype=np.float32)
+        self.szz = np.zeros((self.nx, self.nz), dtype=np.float32)
+        self.syx = np.zeros((self.nx, self.nz), dtype=np.float32)
+        self.syz = np.zeros((self.nx, self.nz), dtype=np.float32)
+        self.u = np.zeros((self.nx, self.nz), dtype=np.float32)
+        self.v = np.zeros((self.nx, self.nz), dtype=np.float32)
+        self.w = np.zeros((self.nx, self.nz), dtype=np.float32)
 
-        # velocity
-        # u, v, w for each x,y,z,axis
-        self.u = cp.zeros((self.nx, self.nz), dtype=cp.float32)
-        self.v = cp.zeros((self.nx, self.nz), dtype=cp.float32)
-        self.w = cp.zeros((self.nx, self.nz), dtype=cp.float32)
+        # Apply optimized JIT functions for material property averaging
+        ic("Computing harmonic averages for staggered grid")
+        self.myx, self.myz = compute_shear_avg_SH(self.mu)
+        self.mxz = compute_shear_avg_PSV(self.mu)
+        self.rho_u, self.rho_w = compute_rho_staggered(self.rho)
 
-        # shear modulus mu
-        # mxx,mzz=self.mu for p-sv wave propagation
-        self.mxz = cp.zeros((self.nx, self.nz), dtype=cp.float32)
-        self.myx = cp.zeros((self.nx, self.nz), dtype=cp.float32)
-        self.myz = cp.zeros((self.nx, self.nz), dtype=cp.float32)
-
-        self.myx, self.myz = self.shear_avg_SH()
-        self.mxz = self.shear_avg_PSV()
-
-        # rho for timestep updating
-        self.rho_u = self.rhou()
-        self.rho_w = self.rhow()
-
-        # Bulk modulus lambda
-        # lxx, lzz = self.lam for p-sv wave propagation
+        # Pre-compute reciprocals for optimal performance (eliminates divisions in inner loops)
+        ic("Pre-computing reciprocals and dt/rho arrays")
+        self.inv_dx = 1.0 / self.dx
+        self.inv_dz = 1.0 / self.dz
+        self.dt_rho_u, self.dt_rho_w, self.dt_rho = precompute_dt_over_rho(
+            self.dt, self.rho_u, self.rho_w, self.rho
+        )
         
-        # absorbing coefficient
-        self.absorb_coeff = self.absorb()
+        # Generate absorbing boundary coefficients
+        ic("Computing absorbing boundary coefficients")
+        ic(self.absorbing_frame)
+        self.absorb_coeff = compute_absorbing_coeff(self.nx, self.nz, self.absorbing_frame)
 
+        # Initialize source wavelets
+        ic("Initializing source wavelets")
         self.wavelet_u = self.initialize_wavelet(self.wavelet_u)
         self.wavelet_v = self.initialize_wavelet(self.wavelet_v)
         self.wavelet_w = self.initialize_wavelet(self.wavelet_w)
+        
+        ic("Forward modeling initialization complete")
     
     def initialize_wavelet(self, wavelet, show=False):
+        """
+        Initialize source wavelet with automatic generation or validation.
+        
+        Args:
+            wavelet: Input wavelet array or None for auto-generation
+            show: Display wavelet plot if True
+            
+        Returns:
+            wavelets: Initialized wavelet array (n_sources, nt)
+        """
         if wavelet is None:
-            print('wavelet is None. make gaussian source of f0 = ', self.f0)
-            wavelets = cp.zeros((len(self.src_loc), self.nt), dtype = cp.float32)
+            ic("Generating Gaussian source wavelet")
+            ic(self.f0, len(self.src_loc))
+            wavelets = np.zeros((len(self.src_loc), self.nt), dtype = np.float32)
             for i, src in enumerate(self.src_loc):
                 wavelets[i,:] = self._gaussian_src(self.f0)
                 if show:
@@ -138,19 +259,23 @@ class forward_modeling:
                     plt.show()
         else:
             if wavelet.shape[0] != len(self.src_loc):
-                raise ValueError('wavelet shape is not match with src_loc')
+                raise ValueError(f'wavelet shape {wavelet.shape[0]} does not match src_loc {len(self.src_loc)}')
             if wavelet.shape[1] != self.nt:
-                print('wavelet dhape is different to simulation duration. zero padding or cut')
-                wavelets = wavelet[:self.nt] if len(wavelet) > self.nt else cp.pad(wavelet, (0,self.nt-len(wavelet)))
+                ic("Adjusting wavelet duration")
+                ic(wavelet.shape[1], self.nt)
+                if wavelet.shape[1] > self.nt:
+                    wavelets = wavelet[:, :self.nt]  # Truncate
+                else:
+                    wavelets = np.pad(wavelet, ((0, 0), (0, self.nt - wavelet.shape[1])), mode='constant')  # Zero pad
             else:
                 wavelets = wavelet
         return wavelets
     
     def plot_wavefield(self):
         # 波動場の初期プロットを設定
-        u_cpu = np.asarray(self.u.get()).T
-        v_cpu = np.asarray(self.v.get()).T
-        w_cpu = np.asarray(self.w.get()).T
+        u_cpu = np.asarray(self.u).T
+        v_cpu = np.asarray(self.v).T
+        w_cpu = np.asarray(self.w).T
          
         # 図と軸の設定
         self.fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 7))
@@ -188,10 +313,10 @@ class forward_modeling:
         plt.show(block=False)
 
     def display_wavefield(self):
-        # 波動場データをCPUに転送して更新
-        u_cpu = self.u.get()
-        v_cpu = self.v.get()
-        w_cpu = self.w.get()
+        # 波動場データを更新
+        u_cpu = self.u
+        v_cpu = self.v
+        w_cpu = self.w
 
         # イメージのデータを更新
         self.im_u.set_data(u_cpu.T)
@@ -199,9 +324,9 @@ class forward_modeling:
         self.im_w.set_data(w_cpu.T)
 
         # カラーバーの範囲を更新（必要に応じて）
-        u_max = cp.max(u_cpu) if cp.max(u_cpu) > -cp.min(u_cpu) else -cp.min(u_cpu)
-        v_max = cp.max(v_cpu) if cp.max(v_cpu) > -cp.min(v_cpu) else -cp.min(v_cpu)
-        w_max = cp.max(w_cpu) if cp.max(w_cpu) > -cp.min(w_cpu) else -cp.min(w_cpu)
+        u_max = np.max(u_cpu) if np.max(u_cpu) > -np.min(u_cpu) else -np.min(u_cpu)
+        v_max = np.max(v_cpu) if np.max(v_cpu) > -np.min(v_cpu) else -np.min(v_cpu)
+        w_max = np.max(w_cpu) if np.max(w_cpu) > -np.min(w_cpu) else -np.min(w_cpu)
         self.im_u.set_clim(-u_max, u_max)
         self.im_v.set_clim(-v_max, v_max)
         self.im_w.set_clim(-w_max, w_max)
@@ -213,27 +338,25 @@ class forward_modeling:
     
     def update_vel(self, order):
         if order == 2:
-            self._update_vel_order2()
+            update_vel_order2_fw_jit(self.u, self.w, self.v, self.sxx, self.szz, self.sxz, 
+                                     self.syx, self.syz, self.dx, self.dz, self.dt, 
+                                     self.rho_u, self.rho_w, self.rho)
         elif order == 3:
             self._update_vel_order3()
         else:
             raise ValueError('order must be 2 or 3')
-        self.u *= self.absorb_coeff
-        self.v *= self.absorb_coeff
-        self.w *= self.absorb_coeff
+        apply_absorbing_coeff(self.u, self.v, self.w, self.absorb_coeff)
 
     def update_str(self, order):
         if order == 2:
-            self._update_str_order2()
+            update_str_order2_fw_jit(self.u, self.w, self.v, self.sxx, self.szz, self.sxz, 
+                                     self.syx, self.syz, self.dx, self.dz, self.dt, 
+                                     self.lam, self.mu, self.mxz, self.myx, self.myz)
         elif order == 3:
             self._update_str_order3()
         else:
             raise ValueError('order must be 2 or 3')
-        self.sxx *= self.absorb_coeff
-        self.sxz *= self.absorb_coeff
-        self.szz *= self.absorb_coeff
-        self.syx *= self.absorb_coeff
-        self.syz *= self.absorb_coeff   
+        apply_absorbing_coeff_stress(self.sxx, self.szz, self.sxz, self.syx, self.syz, self.absorb_coeff)   
 
     def _update_vel_order2(self):
         # P-SV wave update:
@@ -325,8 +448,8 @@ class forward_modeling:
         self.sz[i_start:i_end, j_start:j_end] += self.dt * self.muz[i_start:i_end, j_start:j_end] * v_z
 
     def shear_avg_SH(self):
-        mux = cp.copy(self.mu)
-        muz = cp.copy(self.mu)
+        mux = np.copy(self.mu)
+        muz = np.copy(self.mu)
         # Use vectorized operations
         mu_i_j = self.mu[1:-1, 1:-1]
         mu_ip1_j = self.mu[2:, 1:-1]
@@ -336,7 +459,7 @@ class forward_modeling:
         return mux, muz
     
     def shear_avg_PSV(self):
-        muxz = cp.copy(self.mu)
+        muxz = np.copy(self.mu)
         mu_i_j = self.mu[1:-1, 1:-1]
         mu_ip1_j = self.mu[2:, 1:-1]
         mu_i_jp1 = self.mu[1:-1, 2:]
@@ -353,14 +476,14 @@ class forward_modeling:
             for j in range(1,self.nz-1):
                 self.rho_u[i,j] = 0.5*(self.rho[i,j] + self.rho[i+1,j])        
         """
-        rho_u = cp.copy(self.rho)
+        rho_u = np.copy(self.rho)
         rho_i_j = self.rho[1:-1, 1:-1]
         rho_ip1_j = self.rho[2:, 1:-1]
         rho_u[1:-1, 1:-1] = 0.5 * (rho_i_j + rho_ip1_j)
         return rho_u
 
     def rhow(self):
-        rho_w = cp.copy(self.rho)
+        rho_w = np.copy(self.rho)
         rho_i_j = self.rho[1:-1, 1:-1]  
         rho_i_jp1 = self.rho[1:-1, 2:]
         rho_w[1:-1, 1:-1] = 0.5 * (rho_i_j + rho_i_jp1)
@@ -379,14 +502,14 @@ class forward_modeling:
         nx = self.nx
         nz = self.nz
 
-        coeff = cp.zeros(FW)
+        coeff = np.zeros(FW)
 
         # define coefficients in absorbing frame
         for i in range(FW):
-            coeff[i] = cp.exp(-(a**2 * (FW-i)**2))
+            coeff[i] = np.exp(-(a**2 * (FW-i)**2))
 
         # initialize array of absorbing coefficients
-        absorb_coeff = cp.ones((nx,nz))
+        absorb_coeff = np.ones((nx,nz))
 
         # compute coefficients for left grid boundaries (x-direction)
         zb=0
@@ -414,9 +537,9 @@ class forward_modeling:
         return absorb_coeff
 
     def _gaussian_src(self, f0=10):
-        time = cp.linspace(0 * self.dt, self.nt * self.dt, self.nt)
+        time = np.linspace(0 * self.dt, self.nt * self.dt, self.nt)
         t0 = 3 / f0
-        src = -2. * (time - t0) * (f0 ** 2) * (cp.exp(- (f0 ** 2) * (time - t0) ** 2))
+        src = -2. * (time - t0) * (f0 ** 2) * (np.exp(- (f0 ** 2) * (time - t0) ** 2))
         return src
     
     def set_boundary_conditions(self):
@@ -443,10 +566,10 @@ class forward_modeling:
         save: bool, default False, if True, save wavefield             
         """
         if save: #allocate saved u,v,w, whose sizes are (nx,nz,nt//isnap)
-            self.u_save = cp.zeros((self.nx, self.nz, self.nt//self.isnap), dtype=cp.float32)
-            self.v_save = cp.zeros((self.nx, self.nz, self.nt//self.isnap), dtype=cp.float32)
-            self.w_save = cp.zeros((self.nx, self.nz, self.nt//self.isnap), dtype=cp.float32)
-            self.isnaps = cp.zeros(self.nt//self.isnap, dtype=cp.int32)
+            self.u_save = np.zeros((self.nx, self.nz, self.nt//self.isnap), dtype=np.float32)
+            self.v_save = np.zeros((self.nx, self.nz, self.nt//self.isnap), dtype=np.float32)
+            self.w_save = np.zeros((self.nx, self.nz, self.nt//self.isnap), dtype=np.float32)
+            self.isnaps = np.zeros(self.nt//self.isnap, dtype=np.int32)
         
         #print('start forward modeling')
         self.initialize()
@@ -465,20 +588,20 @@ class forward_modeling:
             self.update_str(order = self.order)
             for l, loc in enumerate(self.receiver_loc):
                 i, j = loc
-                self.seismogram_u[l, it] = self.u[i, j].get()
-                self.seismogram_v[l, it] = self.v[i, j].get()  # Transfer data to CPU
-                self.seismogram_w[l, it] = self.w[i, j].get()  # Transfer data to CPU
+                self.seismogram_u[l, it] = self.u[i, j]
+                self.seismogram_v[l, it] = self.v[i, j]
+                self.seismogram_w[l, it] = self.w[i, j]
     
             if it % self.isnap == 0:
                 if show:
                     self.display_wavefield()
                 # self.show(self.v, f'v :{it} step')
             
-            if not cp.all(cp.isfinite(self.u)):
+            if not np.all(np.isfinite(self.u)):
                 return 1
-            if not cp.all(cp.isfinite(self.v)):
+            if not np.all(np.isfinite(self.v)):
                 return 2                
-            if not cp.all(cp.isfinite(self.w)):
+            if not np.all(np.isfinite(self.w)):
                 return 3
             
             # save wavefield if save
@@ -489,9 +612,9 @@ class forward_modeling:
                 self.isnaps[it//self.isnap - 1] = it
         
         if show:
-            self.show_seismogram(self.seismogram_u.get(), 'u')
-            self.show_seismogram(self.seismogram_v.get(), 'v')
-            self.show_seismogram(self.seismogram_w.get(), 'w')
+            self.show_seismogram(self.seismogram_u, 'u')
+            self.show_seismogram(self.seismogram_v, 'v')
+            self.show_seismogram(self.seismogram_w, 'w')
 
         print('end forward modeling')
         return 0

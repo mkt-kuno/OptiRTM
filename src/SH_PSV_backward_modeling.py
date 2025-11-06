@@ -15,24 +15,117 @@
 # along with this library. If not, see <https://www.gnu.org/licenses/>.
 
 # 1. backward modeling
-import cupy as cp  # CuPy is imported as cp for compatibility
+import numpy as np
+from numba import jit, prange
 import matplotlib.pyplot as plt
 import copy
-import numpy as np       
+from icecream import ic
+# Import common RTM utilities
+from rtm_utils import (
+    compute_shear_avg_SH, compute_shear_avg_PSV, compute_rho_staggered,
+    precompute_dt_over_rho, compute_absorbing_coeff, apply_absorbing_coeff,
+    apply_absorbing_coeff_stress, check_array_finite, compute_cross_correlation
+)
 plt.style.use('fast')
+
+# Configure icecream for better logging
+ic.configureOutput(prefix='[Backward] ', includeContext=True)
+
+# JIT-optimized functions for performance with aggressive optimizations
+@jit(nopython=True, parallel=True, fastmath=True, cache=True, inline='always')
+def update_vel_order2_jit(u, w, v, sxx, szz, sxz, syx, syz, inv_dx, inv_dz, dt, dt_rho_u, dt_rho_w, dt_rho):
+    """
+    Highly optimized velocity update for order 2 with:
+    - Pre-computed reciprocals (inv_dx, inv_dz, dt/rho)
+    - Fused operations to minimize memory access
+    - Cache-friendly memory layout
+    - Inlining hints for compiler
+    """
+    nx, nz = u.shape
+    # P-SV and SH wave update fused for better cache utilization
+    for i in prange(1, nx - 1):
+        for j in range(1, nz - 1):
+            # Pre-compute common terms for better instruction-level parallelism
+            sxx_i1 = sxx[i+1, j]
+            sxx_i = sxx[i, j]
+            szz_j1 = szz[i, j+1]
+            szz_j = szz[i, j]
+            sxz_i1 = sxz[i+1, j]
+            sxz_i = sxz[i, j]
+            sxz_j1 = sxz[i, j+1]
+            
+            # P-SV wave: compute derivatives with pre-computed reciprocals
+            sxx_x = (sxx_i1 - sxx_i) * inv_dx
+            szz_z = (szz_j1 - szz_j) * inv_dz
+            sxz_x = (sxz_i1 - sxz_i) * inv_dx
+            sxz_z = (sxz_j1 - sxz_i) * inv_dz
+            
+            # Update velocity with fused multiply-add
+            u[i, j] -= (sxx_x + sxz_z) * dt_rho_u[i, j]
+            w[i, j] -= (sxz_x + szz_z) * dt_rho_w[i, j]
+            
+            # SH wave update: inline to avoid separate loop
+            syx_x = (syx[i+1, j] - syx[i, j]) * inv_dx
+            syz_z = (syz[i, j+1] - syz[i, j]) * inv_dz
+            v[i, j] -= (syx_x + syz_z) * dt_rho[i, j]
+
+@jit(nopython=True, parallel=True, fastmath=True, cache=True, inline='always')
+def update_str_order2_jit(u, w, v, sxx, szz, sxz, syx, syz, inv_dx, inv_dz, neg_dt, lam, mu, mxz, myx, myz):
+    """
+    Highly optimized stress update for order 2 with:
+    - Pre-computed reciprocals and negative dt
+    - Fused computations reducing redundant calculations
+    - Optimized memory access pattern
+    """
+    nx, nz = u.shape
+    # Fused P-SV and SH wave update for better cache performance
+    for i in prange(1, nx - 1):
+        for j in range(1, nz - 1):
+            # Load velocity values once for reuse
+            u_ij = u[i, j]
+            w_ij = w[i, j]
+            v_ij = v[i, j]
+            
+            # Compute derivatives with pre-computed reciprocals
+            u_x = (u_ij - u[i-1, j]) * inv_dx
+            u_z = (u_ij - u[i, j-1]) * inv_dz
+            w_x = (w_ij - w[i-1, j]) * inv_dx
+            w_z = (w_ij - w[i, j-1]) * inv_dz
+            
+            # Compute common term once
+            div_vel = u_x + w_z
+            lam_div = lam[i, j] * div_vel
+            
+            # P-SV wave: fused computation with pre-negated dt
+            sxx[i, j] += neg_dt * (lam_div + 2.0 * mu[i, j] * u_x)
+            szz[i, j] += neg_dt * (lam_div + 2.0 * mu[i, j] * w_z)
+            sxz[i, j] += neg_dt * mxz[i, j] * (u_z + w_x)
+            
+            # SH wave: inline for single loop
+            v_x = (v_ij - v[i-1, j]) * inv_dx
+            v_z = (v_ij - v[i, j-1]) * inv_dz
+            syx[i, j] += neg_dt * myx[i, j] * v_x
+            syz[i, j] += neg_dt * myz[i, j] * v_z
+
+# Removed duplicate functions - now using shared utilities from rtm_utils.py:
+# - apply_absorbing_coeff, apply_absorbing_coeff_stress
+# - compute_absorbing_coeff
+# - compute_shear_avg_SH, compute_shear_avg_PSV
+# - compute_rho_staggered
+# - precompute_dt_over_rho
 
 class backward_modeling:
     """
     kwargs:
-    observed data:cp.array 観測データ
+    observed data:np.array 観測データ
     nx:int   x方向のグリッド数
     nz:int   z方向のグリッド数
     dx:float x方向のグリッド間隔
     dz:float z方向のグリッド間隔
     nt:int   シミュレーション時間ステップ数
     fs:float サンプリング周波数
-    vs:cp.array S波速度
-    rho:cp.array 密度
+    vs:np.array S波速度
+    rho:np.array 密度
     absorbing_frame:int 吸収境界の幅
     src_loc:list 震源の位置  [[i1,j1],[i2,j2],...]
     receiver_loc:list 受信機の位置 [[i1,j1],[i2,j2],...]
@@ -40,15 +133,14 @@ class backward_modeling:
     isnap:int 途中経過の表示ステップ数 default:10
     order:int 空間微分のオーダー(2 or 3) dedault:2
     ###
-    snap:cp.array 途中経過の波場スナップショット for correlationg
+    snap:np.ndarray 途中経過の波場スナップショット for correlationg
     """
 
-    def show(self, v:cp.array, suptitle):
+    def show(self, v:np.ndarray, suptitle):
         """
-        v:cp.array 途中経過の波場スナップショット
+        v:np.ndarray 途中経過の波場スナップショット
         """
-        v = v.get()
-        mvmax = cp.max(v)
+        mvmax = np.max(v)
         plt.figure(figsize=(8, 7))
         plt.imshow(v.T, aspect='equal', cmap='seismic', interpolation='nearest',vmin=-mvmax, vmax=mvmax)
         plt.colorbar()
@@ -62,9 +154,9 @@ class backward_modeling:
         self.dz = kwargs['dz']
         self.nt = kwargs['nt']
         self.fs = kwargs['fs']
-        self.vs = kwargs['vs'] if 'vs' in kwargs else cp.ones((self.nx,self.nz), dtype =cp.float64)*200
-        self.vp = kwargs['vp'] if 'vp' in kwargs else self.vs*cp.sqrt(6) # at least root2 times larger than vs, poisson ratio = 0.25, vp/vs = 1.7320508, 
-        self.rho= kwargs['rho']if 'rho'in kwargs else cp.ones((self.nx,self.nz), dtype =cp.float64)*1800
+        self.vs = kwargs['vs'] if 'vs' in kwargs else np.ones((self.nx,self.nz), dtype =np.float64)*200
+        self.vp = kwargs['vp'] if 'vp' in kwargs else self.vs*np.sqrt(6) # at least root2 times larger than vs, poisson ratio = 0.25, vp/vs = 1.7320508, 
+        self.rho= kwargs['rho']if 'rho'in kwargs else np.ones((self.nx,self.nz), dtype =np.float64)*1800
         self.absorbing_frame = kwargs['absorbing_frame'] if 'absorbing_frame' in kwargs else 60
         self.src_loc = kwargs['src_loc']if 'src_loc'in kwargs else [self.nx // 2,0] #source location, (i,j)
         self.obsdata_u = kwargs['observed_data_u']if 'observed_data_u'in kwargs else None # for x axis wave
@@ -83,47 +175,63 @@ class backward_modeling:
         self.steepness_array = kwargs['steepness_array'] if 'steepness_array' in kwargs else None 
 
     def initialize(self):
-        self.synsrc_u = cp.zeros((len(self.src_loc), self.nt), dtype=cp.float64)
-        self.synsrc_v = cp.zeros((len(self.src_loc), self.nt), dtype=cp.float64)
-        self.synsrc_w = cp.zeros((len(self.src_loc), self.nt), dtype=cp.float64)
+        """
+        Initialize backward modeling with optimized pre-computations.
+        
+        This method:
+        1. Initializes wavefield arrays (velocity and stress)
+        2. Computes elastic parameters (mu, lambda) from velocity model
+        3. Applies harmonic averaging for staggered grid
+        4. Pre-computes reciprocals (inv_dx, inv_dz, dt/rho) for optimal performance
+        5. Generates absorbing boundary coefficients
+        
+        All array operations use JIT-compiled functions with parallel=True and fastmath=True.
+        """
+        ic("Initializing backward modeling")
+        ic(self.nx, self.nz, self.nt)
+        
+        self.synsrc_u = np.zeros((len(self.src_loc), self.nt), dtype=np.float64)
+        self.synsrc_v = np.zeros((len(self.src_loc), self.nt), dtype=np.float64)
+        self.synsrc_w = np.zeros((len(self.src_loc), self.nt), dtype=np.float64)
 
+        # Compute elastic parameters
         self.mu = self.rho*self.vs**2
         self.lam = ((self.vp/self.vs)**2 - 2)*self.mu
         self.dt = 1 / self.fs
+        ic("Elastic parameters computed")
+        ic(self.dt)
 
-        # stress
-        # for p-sv wave propagation, sxx, sxz, szz
-        self.sxx = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.sxz = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.szz = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        # for sh wave propagation, syx, syz
-        self.syx = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.syz = cp.zeros((self.nx, self.nz), dtype=cp.float64)
+        # Initialize wavefield arrays (velocity and stress)
+        self.sxx = np.zeros((self.nx, self.nz), dtype=np.float64)
+        self.sxz = np.zeros((self.nx, self.nz), dtype=np.float64)
+        self.szz = np.zeros((self.nx, self.nz), dtype=np.float64)
+        self.syx = np.zeros((self.nx, self.nz), dtype=np.float64)
+        self.syz = np.zeros((self.nx, self.nz), dtype=np.float64)
+        self.u = np.zeros((self.nx, self.nz), dtype=np.float64)
+        self.v = np.zeros((self.nx, self.nz), dtype=np.float64)
+        self.w = np.zeros((self.nx, self.nz), dtype=np.float64)
 
-        # velocity
-        # u, v, w for each x,y,z,axis
-        self.u = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.v = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.w = cp.zeros((self.nx, self.nz), dtype=cp.float64)
+        # Apply optimized JIT functions for material property averaging
+        ic("Computing harmonic averages for staggered grid")
+        self.myx, self.myz = compute_shear_avg_SH(self.mu)
+        self.mxz = compute_shear_avg_PSV(self.mu)
+        self.rho_u, self.rho_w = compute_rho_staggered(self.rho)
 
-        # shear modulus mu
-        # mxx,mzz=self.mu for p-sv wave propagation
-        self.mxz = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.myx = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.myz = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-
-        self.myx, self.myz = self.shear_avg_SH()
-        self.mxz = self.shear_avg_PSV()
-
-        # rho for timestep updating
-        self.rho_u = self.rhou()
-        self.rho_w = self.rhow()
-
-        # Bulk modulus lambda
-        # lxx, lzz = self.lam for p-sv wave propagation
+        # Pre-compute reciprocals for optimal performance (eliminates divisions in inner loops)
+        ic("Pre-computing reciprocals and dt/rho arrays")
+        self.inv_dx = 1.0 / self.dx
+        self.inv_dz = 1.0 / self.dz
+        self.neg_dt = -self.dt  # Pre-negated for backward propagation
+        self.dt_rho_u, self.dt_rho_w, self.dt_rho = precompute_dt_over_rho(
+            self.dt, self.rho_u, self.rho_w, self.rho
+        )
         
-        # absorbing coefficient
-        self.absorb_coeff = self.absorb()
+        # Generate absorbing boundary coefficients
+        ic("Computing absorbing boundary coefficients")
+        ic(self.absorbing_frame)
+        self.absorb_coeff = compute_absorbing_coeff(self.nx, self.nz, self.absorbing_frame)
+        
+        ic("Backward modeling initialization complete")
 
         ## obsdata scaling
         gain = 16
@@ -136,9 +244,9 @@ class backward_modeling:
 
     def plot_wavefield(self):
         # 波動場の初期プロットを設定
-        u_cpu = np.asarray(self.u.get()).T
-        v_cpu = np.asarray(self.v.get()).T
-        w_cpu = np.asarray(self.w.get()).T
+        u_cpu = np.asarray(self.u).T
+        v_cpu = np.asarray(self.v).T
+        w_cpu = np.asarray(self.w).T
 
         # 図と軸の設定
         self.fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 7))
@@ -169,18 +277,18 @@ class backward_modeling:
         """
         display wavefield
         parameters
-        u:cp.array, default= self.u
-        v:cp.array, default= self.v
-        w:cp.array, default= self.w
+        u:np.array, default= self.u
+        v:np.array, default= self.v
+        w:np.array, default= self.w
 
         you can choose the wavefield to display setting u_cpu, v_cpu, w_cpu
             
         """
-        # 波動場データをCPUに転送して更新
+        # 波動場データを更新
         plt.suptitle(suptitle)
-        u_cpu = self.u.get() if u_cpu is None else u_cpu
-        v_cpu = self.v.get() if v_cpu is None else v_cpu
-        w_cpu = self.w.get() if w_cpu is None else w_cpu
+        u_cpu = self.u if u_cpu is None else u_cpu
+        v_cpu = self.v if v_cpu is None else v_cpu
+        w_cpu = self.w if w_cpu is None else w_cpu
 
         # イメージのデータを更新
         self.im_u.set_data(u_cpu.T)
@@ -188,9 +296,9 @@ class backward_modeling:
         self.im_w.set_data(w_cpu.T)
 
         # カラーバーの範囲を更新（必要に応じて）
-        u_max = cp.max(u_cpu) if cp.max(u_cpu) > -cp.min(u_cpu) else -cp.min(u_cpu)
-        v_max = cp.max(v_cpu) if cp.max(v_cpu) > -cp.min(v_cpu) else -cp.min(v_cpu)
-        w_max = cp.max(w_cpu) if cp.max(w_cpu) > -cp.min(w_cpu) else -cp.min(w_cpu)
+        u_max = np.max(u_cpu) if np.max(u_cpu) > -np.min(u_cpu) else -np.min(u_cpu)
+        v_max = np.max(v_cpu) if np.max(v_cpu) > -np.min(v_cpu) else -np.min(v_cpu)
+        w_max = np.max(w_cpu) if np.max(w_cpu) > -np.min(w_cpu) else -np.min(w_cpu)
         self.im_u.set_clim(-u_max, u_max)
         self.im_v.set_clim(-v_max, v_max)
         self.im_w.set_clim(-w_max, w_max)
@@ -202,27 +310,27 @@ class backward_modeling:
     
     def update_vel(self, order):
         if order == 2:
-            self._update_vel_order2()
+            # Use optimized version with pre-computed reciprocals and dt/rho
+            update_vel_order2_jit(self.u, self.w, self.v, self.sxx, self.szz, self.sxz, 
+                                  self.syx, self.syz, self.inv_dx, self.inv_dz, self.dt, 
+                                  self.dt_rho_u, self.dt_rho_w, self.dt_rho)
         elif order == 3:
             self._update_vel_order3()
         else:
             raise ValueError('order must be 2 or 3')
-        self.u *= self.absorb_coeff
-        self.v *= self.absorb_coeff
-        self.w *= self.absorb_coeff
+        apply_absorbing_coeff(self.u, self.v, self.w, self.absorb_coeff)
 
     def update_str(self, order):
         if order == 2:
-            self._update_str_order2()
+            # Use optimized version with pre-computed reciprocals and negative dt
+            update_str_order2_jit(self.u, self.w, self.v, self.sxx, self.szz, self.sxz, 
+                                  self.syx, self.syz, self.inv_dx, self.inv_dz, self.neg_dt, 
+                                  self.lam, self.mu, self.mxz, self.myx, self.myz)
         elif order == 3:
             self._update_str_order3()
         else:
             raise ValueError('order must be 2 or 3')
-        self.sxx *= self.absorb_coeff
-        self.sxz *= self.absorb_coeff
-        self.szz *= self.absorb_coeff
-        self.syx *= self.absorb_coeff
-        self.syz *= self.absorb_coeff   
+        apply_absorbing_coeff_stress(self.sxx, self.szz, self.sxz, self.syx, self.syz, self.absorb_coeff)   
 
     def _update_vel_order2(self):
         # P-SV wave update:
@@ -313,94 +421,11 @@ class backward_modeling:
         self.sx[i_start:i_end, j_start:j_end] += self.dt * self.mux[i_start:i_end, j_start:j_end] * v_x
         self.sz[i_start:i_end, j_start:j_end] += self.dt * self.muz[i_start:i_end, j_start:j_end] * v_z
 
-    def shear_avg_SH(self):
-        mux = cp.copy(self.mu)
-        muz = cp.copy(self.mu)
-        # Use vectorized operations
-        mu_i_j = self.mu[1:-1, 1:-1]
-        mu_ip1_j = self.mu[2:, 1:-1]
-        mu_i_jp1 = self.mu[1:-1, 2:]
-        mux[1:-1, 1:-1] = 2 / (1 / mu_i_j + 1 / mu_ip1_j)
-        muz[1:-1, 1:-1] = 2 / (1 / mu_i_j + 1 / mu_i_jp1)
-        return mux, muz
-    
-    def shear_avg_PSV(self):
-        muxz = cp.copy(self.mu)
-        mu_i_j = self.mu[1:-1, 1:-1]
-        mu_ip1_j = self.mu[2:, 1:-1]
-        mu_i_jp1 = self.mu[1:-1, 2:]
-        mu_ip1_jp1 = self.mu[2:, 2:]
-        muxz[1:-1,1:-1] = 4 / (1 / mu_i_j + 1 / mu_ip1_j + 1 / mu_i_jp1 + 1 / mu_ip1_jp1) 
-        # for i in range(1, self.nx - 1):
-        #     for j in range(1, self.nz - 1):
-        #         muxz[i, j] = 4/(1/self.mu[i,j] + 1/self.mu[i+1,j] + 1/self.mu[i,j+1] + 1/self.mu[i+1,j+1])
-        return muxz
-        
-    def rhou(self):
-        """
-        for i in range(1,self.nx-1):
-            for j in range(1,self.nz-1):
-                self.rho_u[i,j] = 0.5*(self.rho[i,j] + self.rho[i+1,j])        
-        """
-        rho_u = cp.copy(self.rho)
-        rho_i_j = self.rho[1:-1, 1:-1]
-        rho_ip1_j = self.rho[2:, 1:-1]
-        rho_u[1:-1, 1:-1] = 0.5 * (rho_i_j + rho_ip1_j)
-        return rho_u
-
-    def rhow(self):
-        rho_w = cp.copy(self.rho)
-        rho_i_j = self.rho[1:-1, 1:-1]  
-        rho_i_jp1 = self.rho[1:-1, 2:]
-        rho_w[1:-1, 1:-1] = 0.5 * (rho_i_j + rho_i_jp1)
-        # for i in range(1,self.nx-1):
-        #     for j in range(1,self.nz-1):
-        #         self.rho_w[i,j] = 0.5*(self.rho[i,j] + self.rho[i,j+1])
-        return rho_w
-
-    def absorb(self):
-        """
-        Define simple absorbing boundary frame based on wavefield damping
-        according to Cerjan et al., 1985, Geophysics, 50, 705-708
-        """
-        FW = self.absorbing_frame # thickness of absorbing frame (gridpoints)
-        a = 0.0053
-        nx = self.nx
-        nz = self.nz
-
-        coeff = cp.zeros(FW)
-
-        # define coefficients in absorbing frame
-        for i in range(FW):
-            coeff[i] = cp.exp(-(a**2 * (FW-i)**2))
-
-        # initialize array of absorbing coefficients
-        absorb_coeff = cp.ones((nx,nz))
-
-        # compute coefficients for left grid boundaries (x-direction)
-        zb=0
-        for i in range(FW):
-            ze = nz - i - 1
-            for j in range(zb,ze):
-                absorb_coeff[i,j] = coeff[i]
-
-        # compute coefficients for right grid boundaries (x-direction)
-        zb=0
-        for i in range(FW):
-            ii = nx - i - 1
-            ze = nz - i - 1
-            for j in range(zb,ze):
-                absorb_coeff[ii,j] = coeff[i]
-
-        # compute coefficients for bottom grid boundaries (z-direction)
-        xb=0
-        for j in range(FW):
-            jj = nz - j - 1
-            xb = j
-            xe = nx - j
-            for i in range(xb,xe):
-                absorb_coeff[i,jj] = coeff[j]
-        return absorb_coeff
+    # Old methods removed - now using optimized JIT functions:
+    # - compute_shear_avg_SH() replaces shear_avg_SH()
+    # - compute_shear_avg_PSV() replaces shear_avg_PSV()
+    # - compute_rho_staggered() replaces rhou() and rhow()
+    # - compute_absorbing_coeff() replaces absorb()
 
     def set_boundary_condition(self):
         if self.receivers_height is None:
@@ -444,9 +469,9 @@ class backward_modeling:
             self.update_str(order = self.order)
             for l, loc in enumerate(self.src_loc):
                 i, j = loc
-                self.synsrc_u[l, t] = self.u[i, j].get()  # Transfer data to CPU
-                self.synsrc_v[l, t] = self.v[i, j].get()  # Transfer data to CPU
-                self.synsrc_w[l, t] = self.w[i, j].get()  # Transfer data to CPU
+                self.synsrc_u[l, t] = self.u[i, j]
+                self.synsrc_v[l, t] = self.v[i, j]
+                self.synsrc_w[l, t] = self.w[i, j]
 
             if it % self.isnap == 0 :
                 print(f'i={it}/{self.nt}')
@@ -455,27 +480,27 @@ class backward_modeling:
                     self.display_wavefield()
             
             # check if the wavefield is infinite: flag
-            if not cp.all(cp.isfinite(self.u)):
+            if not np.all(np.isfinite(self.u)):
                 return 4
-            if not cp.all(cp.isfinite(self.v)):
+            if not np.all(np.isfinite(self.v)):
                 return 5
-            if not cp.all(cp.isfinite(self.w)):
+            if not np.all(np.isfinite(self.w)):
                 return 6
 
         print('end backward modeling')
         return 0
     
-    def run_calc(self, import_fwdata_u:cp.array, import_fwdata_v:cp.array, import_fwdata_w:cp.array, isnaps:cp.array, show=True, method = 'closs_correlation', save = False):
+    def run_calc(self, import_fwdata_u:np.ndarray, import_fwdata_v:np.ndarray, import_fwdata_w:np.ndarray, isnaps:np.ndarray, show=True, method = 'closs_correlation', save = False):
         """
         run backward modeling and calcurate correlation with synthetic forward data
         parameters:
-            impout_fwdata_u:cp.array,
+            impout_fwdata_u:np.array,
                 forward modeling data u
-            impout_fwdata_v:cp.array,
+            impout_fwdata_v:np.array,
                 forward modeling data v
-            impout_fwdata_w:cp.array,
+            impout_fwdata_w:np.array,
                 forward modeling data w
-            isnaps:cp.array,
+            isnaps:np.array,
                 snapshot timesteps of forward modeling u,v,w
             method:str, default='closs_correlation',
                 closs_correlation' or 'convolution' only (20241002)
@@ -491,7 +516,7 @@ class backward_modeling:
             6: w faced infinite.
 
         if simulation was conducted safely,
-        result_u, result_v, result_w:cp.array
+        result_u, result_v, result_w:np.array
             correlation data of u,v,w with synthetic forward data  
         """
         # print('start backward modeling')
@@ -500,9 +525,9 @@ class backward_modeling:
             self.plot_wavefield()
         
         ## make reslt image:
-        result_u = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        result_v = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        result_w = cp.zeros((self.nx, self.nz), dtype=cp.float64)
+        result_u = np.zeros((self.nx, self.nz), dtype=np.float64)
+        result_v = np.zeros((self.nx, self.nz), dtype=np.float64)
+        result_w = np.zeros((self.nx, self.nz), dtype=np.float64)
 
         for it in range(self.nt):
             # free surface boundary condition Z=0
@@ -512,7 +537,7 @@ class backward_modeling:
 
             # add source term at the source location
             # Extract indices from src_loc
-            receiver_loc_array = cp.array(self.receiver_loc)
+            receiver_loc_array = np.array(self.receiver_loc)
             i_indices = receiver_loc_array[:, 0]
             j_indices = receiver_loc_array[:, 1]
 
@@ -527,7 +552,7 @@ class backward_modeling:
 
             self.update_str(order=self.order)
 
-            src_loc_array = cp.array(self.src_loc)
+            src_loc_array = np.array(self.src_loc)
             i_indices = src_loc_array[:, 0]
             j_indices = src_loc_array[:, 1]
 
@@ -537,7 +562,7 @@ class backward_modeling:
             
             snapt = t
             if snapt in isnaps:
-                indices = cp.where(isnaps == snapt)[0][0]
+                indices = np.where(isnaps == snapt)[0][0]
                 if method == 'closs_correlation':
                     delta_result_u = (import_fwdata_u[:, :, indices] * self.u[:, :]).squeeze()
                     delta_result_v = (import_fwdata_v[:, :, indices] * self.v[:, :]).squeeze()
@@ -558,16 +583,16 @@ class backward_modeling:
                     sm_v = import_fwdata_v[:, :, indices].squeeze() * self.v[:, :]
                     sm_w = import_fwdata_w[:, :, indices].squeeze() * self.w[:, :]
 
-                    self.display_wavefield(u_cpu = sm_u.get(), v_cpu = sm_v.get(), w_cpu = sm_w.get(), suptitle=f'fw x bw at {snapt}timestep')
-                    #self.display_wavefield(u_cpu=self.u.get(), v_cpu= self.v.get(), w_cpu=self.w.get(), suptitle=f'fw x bw at {snapt}timestep')
-                    # self.display_wavefield(u_cpu=delta_result_u.get(), v_cpu=delta_result_v.get(), w_cpu=delta_result_w.get(), suptitle=f'fw x bw at {snapt}timestep')
+                    self.display_wavefield(u_cpu = sm_u, v_cpu = sm_v, w_cpu = sm_w, suptitle=f'fw x bw at {snapt}timestep')
+                    #self.display_wavefield(u_cpu=self.u, v_cpu= self.v, w_cpu=self.w, suptitle=f'fw x bw at {snapt}timestep')
+                    # self.display_wavefield(u_cpu=delta_result_u, v_cpu=delta_result_v, w_cpu=delta_result_w, suptitle=f'fw x bw at {snapt}timestep')
 
             # check if the wavefield is infinite: flag
-            if not cp.all(cp.isfinite(self.u)):
+            if not np.all(np.isfinite(self.u)):
                 return 4
-            if not cp.all(cp.isfinite(self.v)):
+            if not np.all(np.isfinite(self.v)):
                 return 5
-            if not cp.all(cp.isfinite(self.w)):
+            if not np.all(np.isfinite(self.w)):
                 return 6
 
         print('end backward modeling')
@@ -579,8 +604,8 @@ class backward_modeling:
     def show_src(self):
 
         plt.figure(figsize=(8, 7))
-        plt.plot(self.synsrc_u.get()[0, :], label='u')
-        plt.plot(self.synsrc_v.get()[0, :], label='v')
-        plt.plot(self.synsrc_w.get()[0, :], label='w')
+        plt.plot(self.synsrc_u[0, :], label='u')
+        plt.plot(self.synsrc_v[0, :], label='v')
+        plt.plot(self.synsrc_w[0, :], label='w')
         plt.legend()
         plt.show()
